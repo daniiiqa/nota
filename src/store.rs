@@ -136,6 +136,18 @@ pub fn shared() -> PathBuf {
     d.join(l("Compartidas", "Shared"))
 }
 
+/// El candado para leer y escribir las compartidas: la ventana de nota y
+/// `nota sync` se turnan, así ninguno pisa lo que el otro acaba de escribir.
+/// Se suelta al soltar el archivo.
+pub fn write_lock() -> Option<fs::File> {
+    use std::os::fd::AsRawFd;
+    let d = PathBuf::from(std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into())).join("nota-sync");
+    let _ = fs::create_dir_all(&d);
+    let f = fs::File::create(d.join("escribir.lock")).ok()?;
+    // SAFETY: flock sobre un descriptor nuestro
+    (unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0).then_some(f)
+}
+
 pub fn is_shared(path: &Path) -> bool {
     path.starts_with(shared())
 }

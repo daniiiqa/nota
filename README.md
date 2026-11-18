@@ -66,14 +66,21 @@ con sus imágenes; otra vez, la regresa.
 
 `nota sync` las cuida de fondo (discada lo arranca al entrar):
 
-- cuando dejas de escribir (3 s), commit;
-- en la misma red se lo manda directo a tus otras compus: se encuentran por
-  mDNS, como picha, y lo que viaja va cifrado (ChaCha20-Poly1305) con la clave
-  que vive en el repo (`.nota/clave`), así que solo tus compus se entienden;
-- y lo empuja a un repo privado (y lo trae cada 45 s), para cuando no se ven.
+- **En vivo, en la misma red**: las dos compus se encuentran por mDNS (como
+  picha) y se quedan conectadas. Cada nota compartida es un documento CRDT
+  (yrs, el de Yjs): lo que escribes viaja como operación y se junta letra por
+  letra con lo que la otra escribe al mismo tiempo, como en Google Docs. De
+  teclear aquí a verlo allá, ~¼ de segundo. Todo va cifrado
+  (ChaCha20-Poly1305) con la clave del repo (`.nota/clave`): solo tus compus
+  se entienden.
+- La ventana de nota guarda las compartidas casi al teclear y, si el archivo
+  cambió por debajo, junta lo tuyo con lo que llegó sin mover el cursor.
+- **Sin verse** (la laptop en la calle): commit cuando dejas de escribir y al
+  repo privado (lo trae cada 45 s). Al reencontrarse, primero se emparejan por
+  git y luego siguen en vivo.
 
-Si las dos compus cambiaron lo mismo no se pierde nada: se queda lo de aquí y
-lo de la otra va al lado, «nota (conflicto senjougahara).md». Todo queda en el
+Si las dos cambiaron lo mismo sin verse no se pierde nada: una versión se queda
+y la otra va al lado, «nota (conflicto senjougahara).md». Todo queda en el
 historial de git.
 
 Para empezar, una vez:

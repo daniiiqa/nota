@@ -182,6 +182,91 @@ impl Doc {
         s
     }
 
+    /// Dónde empieza cada bloque en `text()` (los de relleno vacíos no salen
+    /// en el texto: empiezan donde va el siguiente).
+    fn starts(&self) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let mut at = 0;
+        for b in &self.blocks {
+            let len = match b {
+                Block::Text { ed, filler } => {
+                    let t = block_text(ed);
+                    if *filler && t.is_empty() {
+                        out.push((at, 0));
+                        continue;
+                    }
+                    t.len()
+                }
+                Block::Image { src, .. } => src.len(),
+            };
+            out.push((at, len));
+            at += len + 1;
+        }
+        out
+    }
+
+    /// El cursor como byte de `text()`.
+    pub fn cursor_offset(&self) -> usize {
+        let Some(Block::Text { ed, .. }) = self.blocks.get(self.focus) else {
+            return self.starts().get(self.focus).map(|s| s.0).unwrap_or(0);
+        };
+        let c = ed.cursor();
+        let within = ed.with_buffer(|b| b.lines.iter().take(c.line).map(|l| l.text().len() + 1).sum::<usize>()) + c.index;
+        self.starts().get(self.focus).map(|s| s.0).unwrap_or(0) + within
+    }
+
+    /// Poner el cursor en ese byte de `text()` (en el bloque de texto más cercano).
+    pub fn set_cursor_offset(&mut self, at: usize, fonts: &mut FontSystem) {
+        let starts = self.starts();
+        let mut pick = None;
+        for (i, (s, len)) in starts.iter().enumerate() {
+            if matches!(self.blocks[i], Block::Text { .. }) && at >= *s && at <= s + len {
+                pick = Some((i, at - s));
+            }
+            if *s > at {
+                break;
+            }
+        }
+        let (i, mut within) = pick.unwrap_or_else(|| {
+            // cayó en una imagen: al principio del texto que sigue
+            let i = (0..self.blocks.len()).find(|&i| matches!(self.blocks[i], Block::Text { .. }) && starts[i].0 >= at).unwrap_or(self.blocks.len() - 1);
+            (i, 0)
+        });
+        self.focus = i;
+        if let Some(Block::Text { ed, .. }) = self.blocks.get_mut(i) {
+            let cur = ed.with_buffer(|b| {
+                for (n, l) in b.lines.iter().enumerate() {
+                    let t = l.text();
+                    if within <= t.len() {
+                        let mut k = within;
+                        while !t.is_char_boundary(k) {
+                            k -= 1;
+                        }
+                        return Cursor::new(n, k);
+                    }
+                    within -= t.len() + 1;
+                }
+                let n = b.lines.len().saturating_sub(1);
+                Cursor::new(n, b.lines.last().map(|l| l.text().len()).unwrap_or(0))
+            });
+            ed.set_selection(Selection::None);
+            ed.set_cursor(cur);
+            ed.shape_as_needed(fonts, false);
+        }
+    }
+
+    /// El texto cambió por fuera (la otra compu): recargar sin que el cursor
+    /// brinque.
+    pub fn reload_keep(&mut self, text: &str, fonts: &mut FontSystem, font: &Font) {
+        let old = self.text();
+        if old == text {
+            return;
+        }
+        let at = crate::merge::map(&crate::merge::edits(&old, text), self.cursor_offset());
+        self.load(text, fonts, font);
+        self.set_cursor_offset(at, fonts);
+    }
+
     pub fn is_empty(&self) -> bool {
         self.text().trim().is_empty()
     }
@@ -212,11 +297,6 @@ impl Doc {
     }
 
     /// El texto que cambió por fuera (Obsidian, git pull…).
-    pub fn reload(&mut self, text: &str, fonts: &mut FontSystem, font: &Font) {
-        let focus = self.focus;
-        self.load(text, fonts, font);
-        self.focus = focus.min(self.blocks.len() - 1);
-    }
 
     // ── alturas ──────────────────────────────────────────────────────────────
 

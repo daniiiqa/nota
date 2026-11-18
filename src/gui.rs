@@ -138,6 +138,9 @@ struct Sticky {
     /// creada en esta vuelta: si se cierra vacía, a la basura
     fresh: bool,
     renaming: Option<String>,
+    /// lo último que se leyó o se guardó: la base para juntar lo de aquí con
+    /// lo que cambió por fuera (la otra compu escribiendo a la vez)
+    base: String,
 }
 
 struct ListWin {
@@ -355,6 +358,15 @@ fn clip_set(s: &str) {
     }
 }
 
+/// Escribir sin que nadie lea el archivo a medias (nota sync lo vigila):
+/// a un temporal escondido y luego en su lugar.
+fn write_atomic(p: &Path, text: &str) -> std::io::Result<()> {
+    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = p.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, p)
+}
+
 /// Guardar una imagen en attachments/ de las notas: el renglón y la ruta.
 fn save_image(bytes: &[u8], ext: &str, note_dir: &Path) -> R<(String, PathBuf)> {
     let dir = store::attachments_for(note_dir);
@@ -450,7 +462,7 @@ impl App {
         let dir = path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_else(store::dir);
         let width = (STICKY.0 as f32 - 2.0 * pad(&self.text)).max(50.0);
         let doc = Doc::new(&text, &dir, &mut self.text.fonts, &self.text.font, self.colors, width, 1.0);
-        let st = Sticky { path, doc, scroll: 0.0, dirty: None, mtime, fresh, renaming: None };
+        let st = Sticky { path, doc, scroll: 0.0, dirty: None, mtime, fresh, renaming: None, base: text };
         let size = geom.map_or(STICKY, |g| (g.w.max(200) as u32, g.h.max(120) as u32));
         self.open_window(Kind::Sticky(Box::new(st)), size, geom);
         self.save_state();
@@ -509,10 +521,25 @@ impl App {
             }
         }
         let p = st.path.clone().unwrap();
-        if let Err(e) = std::fs::write(&p, &text) {
+        // cambió por fuera desde que lo leímos: juntar, no pisar
+        let _turno = store::is_shared(&p).then(store::write_lock);
+        let mut text = text;
+        let disk_m = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
+        if disk_m.is_some() && disk_m != st.mtime
+            && let Ok(theirs) = std::fs::read_to_string(&p)
+        {
+            let merged = crate::merge::merge3(&st.base, &text, &theirs);
+            if merged != text {
+                let Text { fonts, font, .. } = &mut self.text;
+                st.doc.reload_keep(&merged, fonts, font);
+                text = merged;
+            }
+        }
+        if let Err(e) = write_atomic(&p, &text) {
             eprintln!("nota: {}: {e}", p.display());
             return;
         }
+        st.base = text;
         st.mtime = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
         let title = self.wins[i].title();
         self.wins[i].window.set_title(title);
@@ -560,19 +587,32 @@ impl App {
     /// preguntarle a Hyprland dónde está cada ventana.
     fn tick(&mut self) {
         for i in 0..self.wins.len() {
-            let due = matches!(&self.wins[i].kind, Kind::Sticky(s) if s.dirty.is_some_and(|d| d.elapsed() > Duration::from_millis(700)));
+            // las compartidas se guardan casi al teclear: la otra compu lo ve al momento
+            let due = matches!(&self.wins[i].kind, Kind::Sticky(s) if s.dirty.is_some_and(|d| {
+                let live = s.path.as_deref().is_some_and(store::is_shared);
+                d.elapsed() > Duration::from_millis(if live { 120 } else { 700 })
+            }));
             if due {
                 self.save(i);
             }
             let Text { fonts, font, .. } = &mut self.text;
             if let Kind::Sticky(st) = &mut self.wins[i].kind
-                && st.dirty.is_none()
                 && let Some(p) = &st.path
             {
+                let _turno = store::is_shared(p).then(store::write_lock);
                 let m = std::fs::metadata(p).and_then(|m| m.modified()).ok();
-                if m.is_some() && m != st.mtime {
+                if m.is_some() && m != st.mtime
+                    && let Ok(theirs) = std::fs::read_to_string(p)
+                {
                     st.mtime = m;
-                    st.doc.reload(&std::fs::read_to_string(p).unwrap_or_default(), fonts, font);
+                    if st.dirty.is_some() {
+                        // escribiendo aquí y cambió allá: lo de los dos
+                        let merged = crate::merge::merge3(&st.base, &st.doc.text(), &theirs);
+                        st.doc.reload_keep(&merged, fonts, font);
+                    } else {
+                        st.doc.reload_keep(&theirs, fonts, font);
+                    }
+                    st.base = theirs;
                     self.redraw(i);
                 }
             }
@@ -1435,9 +1475,9 @@ fn run(first: Cmd, listener: UnixListener) -> R<()> {
         })
         .map_err(|e| e.to_string())?;
     handle
-        .insert_source(Timer::from_duration(Duration::from_millis(500)), |_, _, app: &mut App| {
+        .insert_source(Timer::from_duration(Duration::from_millis(100)), |_, _, app: &mut App| {
             app.tick();
-            TimeoutAction::ToDuration(Duration::from_millis(500))
+            TimeoutAction::ToDuration(Duration::from_millis(100))
         })
         .map_err(|e| e.to_string())?;
 

@@ -120,6 +120,8 @@ fn git_in(d: &Path, args: &[&str], limit: Duration) -> Out {
 struct Repo {
     dir: PathBuf,
     host: String,
+    /// en vivo: lo que va en el CRDT manda sobre lo que diga git
+    live: Option<Arc<Mutex<Live>>>,
 }
 
 impl Repo {
@@ -145,6 +147,11 @@ impl Repo {
 
     /// Lo que cambió, en un commit. true si hubo algo.
     fn commit(&self) -> bool {
+        // una mezcla que quedó a medias (se apagó la compu en ese momento):
+        // nunca guardar las marcas de conflicto; lo de antes ya tenía commit
+        if self.dir.join(".git/MERGE_HEAD").exists() {
+            self.git(&["merge", "--abort"]);
+        }
         if self.git(&["status", "--porcelain"]).out.is_empty() {
             return false;
         }
@@ -155,6 +162,26 @@ impl Repo {
 
     /// Juntar `rev` (lo de otra compu) con lo de aquí. true si trajo algo.
     fn merge(&self, rev: &str, from: &str) -> bool {
+        // en vivo: mientras git mezcla, lo en vivo espera (si no, tomaría las
+        // marcas de conflicto que git escribe un momento por escritas aquí)
+        let guard = self.live.as_ref().map(|l| l.lock().unwrap_or_else(|e| e.into_inner()));
+        let live = guard.as_deref().filter(|l| l.on);
+        let changed = self.merge_git(rev, from, live);
+        // y al terminar, cada nota en vivo con su texto en vivo: ahí manda el CRDT
+        if let Some(l) = live {
+            let _turno = store::write_lock();
+            for (rel, n) in &l.notes {
+                let want = doc_string(&n.doc);
+                let p = self.dir.join(rel);
+                if read(&p).as_deref() != Some(want.as_str()) {
+                    write_atomic(&p, &want);
+                }
+            }
+        }
+        changed
+    }
+
+    fn merge_git(&self, rev: &str, from: &str, live: Option<&Live>) -> bool {
         if self.text(&["rev-parse", "-q", "--verify", rev]).is_empty() {
             return false;
         }
@@ -170,6 +197,12 @@ impl Repo {
         // quedan con el mismo, el de hash menor, para no rebotar para siempre
         let (theirs, mine) = (self.text(&["rev-parse", rev]), self.head());
         if self.text(&["rev-parse", &format!("{rev}^{{tree}}")]) == self.text(&["rev-parse", "HEAD^{tree}"]) {
+            if from == "github" {
+                // a GitHub no se le cambia su commit: juntarlo (es lo mismo,
+                // no hay nada que chocar) para que el push avance
+                let msg = format!("{} ← github", self.host);
+                return self.git(&["merge", "-q", "--no-edit", "--allow-unrelated-histories", "-m", &msg, rev]).ok;
+            }
             if theirs < mine {
                 self.git(&["reset", "-q", "--hard", rev]);
             }
@@ -181,7 +214,7 @@ impl Repo {
         let msg = format!("{} ← {from}", self.host);
         let m = self.git(&["merge", "-q", "--no-edit", "--allow-unrelated-histories", "-m", &msg, rev]);
         if !m.ok {
-            self.resolve(&from, &msg);
+            self.resolve(&from, &msg, live);
         }
         true
     }
@@ -190,12 +223,18 @@ impl Repo {
     /// copia al lado con el nombre de su compu. Cuál se queda no depende de
     /// quién junta (la de la compu que va primero por nombre), así las dos
     /// llegan a lo mismo. Si una la borró y la otra la cambió, gana la cambiada.
-    fn resolve(&self, from: &str, msg: &str) {
+    fn resolve(&self, from: &str, msg: &str, live: Option<&Live>) {
         let list = self.text(&["diff", "--name-only", "--diff-filter=U", "-z"]);
         for f in list.split('\0').filter(|f| !f.is_empty()) {
             let ours = self.git(&["show", &format!(":2:{f}")]);
             let theirs = self.git(&["show", &format!(":3:{f}")]);
             let path = self.dir.join(f);
+            // una nota en vivo: lo que las dos ven ahorita, sin copias
+            let now = live.and_then(|l| l.notes.get(f).map(|n| doc_string(&n.doc)));
+            if let Some(text) = now {
+                let _ = std::fs::write(&path, text);
+                continue;
+            }
             match (ours.ok, theirs.ok) {
                 (true, true) => {
                     let (keep, other, loser) =
@@ -304,18 +343,34 @@ impl Crypt {
     }
 }
 
-/// Un mensaje: [largo u32][nonce + cifrado de "compu\n" + bundle]
-fn send_bundle(addr: SocketAddr, crypt: &Crypt, me: &str, bundle: &[u8]) -> bool {
-    let mut plain = format!("{me}\n").into_bytes();
-    plain.extend_from_slice(bundle);
+// ── los mensajes ─────────────────────────────────────────────────────
+
+/// lo de git: todo el repo
+const BUNDLE: u8 = 1;
+/// «quedémonos conectadas» (lo manda la que no arbitra)
+const HELLO: u8 = 2;
+/// «ya tengo lo mismo que tú» + el commit
+const READY: u8 = 3;
+/// una nota en vivo entera (estado del CRDT)
+const DOC: u8 = 4;
+/// un cambio en vivo de una nota
+const UPD: u8 = 5;
+/// «mándame esa nota en vivo»
+const ASK: u8 = 6;
+
+/// [largo u32][nonce + cifrado de: tipo, "compu\n", contenido]
+fn write_frame(s: &mut TcpStream, crypt: &Crypt, kind: u8, me: &str, payload: &[u8]) -> std::io::Result<()> {
+    let mut plain = vec![kind];
+    plain.extend_from_slice(me.as_bytes());
+    plain.push(b'\n');
+    plain.extend_from_slice(payload);
     let msg = crypt.seal(&plain);
-    let Ok(mut s) = TcpStream::connect_timeout(&addr, Duration::from_secs(3)) else { return false };
-    let _ = s.set_write_timeout(Some(Duration::from_secs(30)));
-    s.write_all(&(msg.len() as u32).to_be_bytes()).and_then(|_| s.write_all(&msg)).is_ok()
+    let mut all = (msg.len() as u32).to_be_bytes().to_vec();
+    all.extend(msg);
+    s.write_all(&all)
 }
 
-fn recv_bundle(mut s: TcpStream, crypt: &Crypt) -> Option<(String, Vec<u8>)> {
-    let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
+fn read_frame(s: &mut TcpStream, crypt: &Crypt) -> Option<(u8, String, Vec<u8>)> {
     let mut len = [0u8; 4];
     s.read_exact(&mut len).ok()?;
     let len = u32::from_be_bytes(len) as usize;
@@ -325,9 +380,352 @@ fn recv_bundle(mut s: TcpStream, crypt: &Crypt) -> Option<(String, Vec<u8>)> {
     let mut buf = vec![0u8; len];
     s.read_exact(&mut buf).ok()?;
     let plain = crypt.open(&buf)?;
-    let nl = plain.iter().position(|&b| b == b'\n')?;
-    let who = String::from_utf8_lossy(&plain[..nl]).to_string();
-    Some((who, plain[nl + 1..].to_vec()))
+    let (&kind, rest) = plain.split_first()?;
+    let nl = rest.iter().position(|&b| b == b'\n')?;
+    Some((kind, String::from_utf8_lossy(&rest[..nl]).into_owned(), rest[nl + 1..].to_vec()))
+}
+
+/// "ruta\0datos"
+fn with_path(rel: &str, data: &[u8]) -> Vec<u8> {
+    let mut v = rel.as_bytes().to_vec();
+    v.push(0);
+    v.extend_from_slice(data);
+    v
+}
+
+fn split_path(p: &[u8]) -> Option<(String, &[u8])> {
+    let z = p.iter().position(|&b| b == 0)?;
+    let rel = String::from_utf8(p[..z].to_vec()).ok()?;
+    // nada fuera de la carpeta
+    if rel.is_empty() || rel.starts_with('/') || rel.split('/').any(|c| c == ".." || c.starts_with('.')) || !rel.ends_with(".md") {
+        return None;
+    }
+    Some((rel, &p[z + 1..]))
+}
+
+fn send_bundle(addr: SocketAddr, crypt: &Crypt, me: &str, bundle: &[u8]) -> bool {
+    let Ok(mut s) = TcpStream::connect_timeout(&addr, Duration::from_secs(3)) else { return false };
+    let _ = s.set_write_timeout(Some(Duration::from_secs(30)));
+    write_frame(&mut s, crypt, BUNDLE, me, bundle).is_ok()
+}
+
+// ── en vivo: las dos escribiendo a la vez ────────────────────────────
+//
+// Con las dos compus en la red quedan conectadas. Primero se emparejan por
+// git (nada de lo escrito sin verse se pierde) y luego cada nota compartida es
+// un documento CRDT (yrs, el de Yjs): cada cambio viaja como operación y se
+// junta letra por letra con lo que la otra escribió al mismo tiempo. La que va
+// primero por nombre arbitra: ella reparte las notas en vivo.
+
+struct LiveNote {
+    doc: yrs::Doc,
+    /// lo que hay en el archivo según nosotros (lo último escrito o leído)
+    text: String,
+}
+
+pub struct Live {
+    dir: PathBuf,
+    me: String,
+    crypt: Arc<Crypt>,
+    /// la conexión con la otra compu: (quién, para escribirle)
+    conn: Option<(String, Arc<Mutex<TcpStream>>)>,
+    /// esta arbitra
+    leader: bool,
+    /// ya en vivo (después de emparejarse por git)
+    on: bool,
+    notes: HashMap<String, LiveNote>,
+    asked: std::collections::HashSet<String>,
+}
+
+fn ytext(doc: &yrs::Doc) -> yrs::TextRef {
+    doc.get_or_insert_text("t")
+}
+
+fn doc_string(doc: &yrs::Doc) -> String {
+    use yrs::{GetString, Transact};
+    let t = ytext(doc);
+    let txn = doc.transact();
+    t.get_string(&txn)
+}
+
+fn doc_state(doc: &yrs::Doc) -> Vec<u8> {
+    use yrs::{ReadTxn, StateVector, Transact};
+    doc.transact().encode_state_as_update_v1(&StateVector::default())
+}
+
+fn doc_apply(doc: &yrs::Doc, bytes: &[u8]) -> bool {
+    use yrs::updates::decoder::Decode;
+    use yrs::{Transact, Update};
+    let Ok(u) = Update::decode_v1(bytes) else { return false };
+    doc.transact_mut().apply_update(u).is_ok()
+}
+
+/// Los cambios de `old` a `new` como operaciones del CRDT: lo que hay que mandar.
+fn doc_edit(doc: &yrs::Doc, old: &str, new: &str) -> Vec<u8> {
+    use yrs::{Text, Transact};
+    let t = ytext(doc);
+    let mut txn = doc.transact_mut();
+    // de atrás para adelante: así los lugares de los anteriores no se mueven
+    for e in crate::merge::edits(old, new).iter().rev() {
+        if e.to > e.from {
+            t.remove_range(&mut txn, e.from as u32, (e.to - e.from) as u32);
+        }
+        if !e.text.is_empty() {
+            t.insert(&mut txn, e.from as u32, &e.text);
+        }
+    }
+    txn.encode_update_v1()
+}
+
+fn read(p: &Path) -> Option<String> {
+    std::fs::read_to_string(p).ok()
+}
+
+fn write_atomic(p: &Path, text: &str) {
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = p.with_file_name(format!(".{name}.sync.tmp"));
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, p);
+    }
+}
+
+impl Live {
+    fn send(&mut self, kind: u8, payload: &[u8]) {
+        let Some((_, w)) = &self.conn else { return };
+        let ok = w.lock().map(|mut s| write_frame(&mut s, &self.crypt, kind, &self.me, payload).is_ok()).unwrap_or(false);
+        if !ok {
+            self.end();
+        }
+    }
+
+    fn end(&mut self) {
+        if let Some((_, w)) = self.conn.take()
+            && let Ok(s) = w.lock()
+        {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+        self.on = false;
+        self.notes.clear();
+        self.asked.clear();
+    }
+
+    fn peer(&self) -> Option<String> {
+        self.conn.as_ref().map(|c| c.0.clone())
+    }
+
+    /// Una nota nueva en vivo, desde lo que hay en el archivo (la que arbitra).
+    fn create(&mut self, rel: &str, text: &str) {
+        use yrs::{Text, Transact};
+        let doc = yrs::Doc::new();
+        {
+            let t = ytext(&doc);
+            let mut txn = doc.transact_mut();
+            t.insert(&mut txn, 0, text);
+        }
+        let state = doc_state(&doc);
+        self.notes.insert(rel.to_string(), LiveNote { doc, text: text.to_string() });
+        self.send(DOC, &with_path(rel, &state));
+    }
+
+    /// Lo que se escribió aquí (el archivo cambió): a la otra.
+    fn ingest(&mut self, rel: &str, file: &str) {
+        if !self.on {
+            return;
+        }
+        if let Some(n) = self.notes.get_mut(rel) {
+            if n.text == file {
+                return;
+            }
+            let upd = doc_edit(&n.doc, &n.text, file);
+            n.text = doc_string(&n.doc);
+            self.send(UPD, &with_path(rel, &upd));
+        } else if self.leader {
+            self.create(rel, file);
+        } else if self.asked.insert(rel.to_string()) {
+            self.send(ASK, &with_path(rel, &[]));
+        }
+    }
+
+    /// El archivo cambió: leerlo (con el candado) y mandarlo.
+    fn ingest_file(&mut self, rel: &str) {
+        let _turno = store::write_lock();
+        if let Some(text) = read(&self.dir.join(rel)) {
+            self.ingest(rel, &text);
+        }
+    }
+
+    /// Escribir el texto en vivo al archivo, sin pisar lo que se haya escrito
+    /// aquí mientras tanto (eso primero se manda y se junta).
+    fn flush(&mut self, rel: &str) {
+        let p = self.dir.join(rel);
+        for _ in 0..5 {
+            if let Some(cur) = read(&p)
+                && self.notes.get(rel).is_some_and(|n| n.text != cur)
+                && self.notes.contains_key(rel)
+            {
+                // lo escrito aquí desde la última vez, primero
+                self.ingest(rel, &cur);
+            }
+            let Some(n) = self.notes.get_mut(rel) else { return };
+            let want = doc_string(&n.doc);
+            if read(&p).as_deref() == Some(want.as_str()) {
+                n.text = want;
+                return;
+            }
+            if read(&p).is_some_and(|cur| cur != n.text) {
+                continue;
+            }
+            write_atomic(&p, &want);
+            n.text = want;
+            return;
+        }
+    }
+
+    fn on_frame(&mut self, kind: u8, payload: &[u8]) {
+        let Some((rel, data)) = split_path(payload) else { return };
+        match kind {
+            DOC => {
+                let _turno = store::write_lock();
+                let doc = yrs::Doc::new();
+                if !doc_apply(&doc, data) {
+                    return;
+                }
+                self.on = true;
+                self.asked.remove(&rel);
+                let text = doc_string(&doc);
+                let p = self.dir.join(&rel);
+                let local = read(&p);
+                self.notes.insert(rel.clone(), LiveNote { doc, text: text.clone() });
+                match local {
+                    // lo de aquí que la otra no tenía, encima
+                    Some(cur) if cur != text => self.ingest(&rel, &cur),
+                    Some(_) => {}
+                    None => write_atomic(&p, &text),
+                }
+            }
+            UPD => {
+                let _turno = store::write_lock();
+                let Some(n) = self.notes.get(&rel) else {
+                    if self.asked.insert(rel.clone()) {
+                        self.send(ASK, &with_path(&rel, &[]));
+                    }
+                    return;
+                };
+                // lo escrito aquí todavía sin mandar va antes
+                if let Some(cur) = read(&self.dir.join(&rel))
+                    && cur != n.text
+                {
+                    self.ingest(&rel, &cur);
+                }
+                if let Some(n) = self.notes.get(&rel)
+                    && doc_apply(&n.doc, data)
+                {
+                    self.flush(&rel);
+                }
+            }
+            ASK if self.leader => {
+                if let Some(n) = self.notes.get(&rel) {
+                    let state = doc_state(&n.doc);
+                    self.send(DOC, &with_path(&rel, &state));
+                } else {
+                    let text = read(&self.dir.join(&rel)).unwrap_or_default();
+                    self.create(&rel, &text);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Ya se emparejaron por git: todas las notas en vivo (la que arbitra).
+    fn start(&mut self) {
+        if self.on || !self.leader || self.conn.is_none() {
+            return;
+        }
+        self.on = true;
+        for rel in md_files(&self.dir).into_keys() {
+            if !self.notes.contains_key(&rel) {
+                let text = read(&self.dir.join(&rel)).unwrap_or_default();
+                self.create(&rel, &text);
+            }
+        }
+    }
+}
+
+/// Las notas de la carpeta (ruta relativa → cuándo cambió y tamaño), sin lo
+/// escondido (.git, .nota, temporales).
+fn md_files(d: &Path) -> HashMap<String, (SystemTime, u64)> {
+    fn walk(d: &Path, base: &Path, out: &mut HashMap<String, (SystemTime, u64)>) {
+        for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+            if e.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let Ok(ft) = e.file_type() else { continue };
+            let p = e.path();
+            if ft.is_dir() {
+                walk(&p, base, out);
+            } else if p.extension().is_some_and(|x| x == "md")
+                && let Ok(m) = e.metadata()
+                && let Ok(rel) = p.strip_prefix(base)
+            {
+                out.insert(rel.to_string_lossy().into_owned(), (m.modified().unwrap_or(UNIX_EPOCH), m.len()));
+            }
+        }
+    }
+    let mut out = HashMap::new();
+    walk(d, d, &mut out);
+    out
+}
+
+/// Cada 50 ms: ¿cambió alguna nota aquí? Va a la otra al momento.
+fn watch(live: Arc<Mutex<Live>>, dir: PathBuf) {
+    let mut seen = md_files(&dir);
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        let on = live.lock().map(|l| l.on).unwrap_or(false);
+        let now = md_files(&dir);
+        if on {
+            for (rel, st) in &now {
+                if seen.get(rel) != Some(st)
+                    && let Ok(mut l) = live.lock()
+                {
+                    l.ingest_file(rel);
+                }
+            }
+        }
+        seen = now;
+    }
+}
+
+/// Leer lo que manda la otra por la conexión que se queda abierta.
+fn reader(mut s: TcpStream, live: Arc<Mutex<Live>>, tx: Sender<Ev>) {
+    let _ = s.set_read_timeout(None);
+    let Some(crypt) = live.lock().ok().map(|l| l.crypt.clone()) else { return };
+    while let Some((kind, who, payload)) = read_frame(&mut s, &crypt) {
+        match kind {
+            BUNDLE => {
+                let f = runtime().join(format!("{}.bundle", safe(&who)));
+                if std::fs::write(&f, payload).is_ok() {
+                    let _ = tx.send(Ev::Bundle(who, f));
+                }
+            }
+            READY => {
+                let _ = tx.send(Ev::Ready(String::from_utf8_lossy(&payload).into_owned()));
+            }
+            DOC | UPD | ASK => {
+                if let Ok(mut l) = live.lock() {
+                    l.on_frame(kind, &payload);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Ok(mut l) = live.lock() {
+        l.end();
+    }
+    let _ = tx.send(Ev::Gone);
 }
 
 // ── el que cuida de fondo ────────────────────────────────────────────
@@ -335,6 +733,10 @@ fn recv_bundle(mut s: TcpStream, crypt: &Crypt) -> Option<(String, Vec<u8>)> {
 enum Ev {
     Peer(String),
     Bundle(String, PathBuf),
+    /// la otra se conectó para estar en vivo (aquí se arbitra)
+    Hello(String),
+    Ready(String),
+    Gone,
 }
 
 type Peers = Arc<Mutex<HashMap<String, Vec<SocketAddr>>>>;
@@ -372,6 +774,7 @@ fn lock() -> Option<std::fs::File> {
 
 struct Status {
     peers: Vec<String>,
+    live: Option<String>,
     last_sync: Option<SystemTime>,
     remote: Option<bool>,
     error: Option<String>,
@@ -383,6 +786,7 @@ impl Status {
         let v = serde_json::json!({
             "pid": std::process::id(),
             "peers": self.peers,
+            "live": self.live,
             "last_sync": secs(self.last_sync),
             "remote": self.remote,
             "error": self.error,
@@ -402,12 +806,23 @@ fn daemon() -> R<()> {
         return Ok(());
     }
     let Some(_lock) = lock() else { return Ok(()) };
-    let repo = Repo { dir: dir.clone(), host: host() };
+    let me = host();
     if Crypt::load(&dir).is_none() {
         new_key(&dir)?;
-        repo.commit();
+        Repo { dir: dir.clone(), host: me.clone(), live: None }.commit();
     }
     let crypt = Arc::new(Crypt::load(&dir).ok_or("sin clave")?);
+    let live = Arc::new(Mutex::new(Live {
+        dir: dir.clone(),
+        me: me.clone(),
+        crypt: crypt.clone(),
+        conn: None,
+        leader: false,
+        on: false,
+        notes: HashMap::new(),
+        asked: Default::default(),
+    }));
+    let repo = Repo { dir: dir.clone(), host: me.clone(), live: Some(live.clone()) };
     let (tx, rx) = channel::<Ev>();
     let peers: Peers = Arc::default();
 
@@ -415,33 +830,59 @@ fn daemon() -> R<()> {
     let listener = TcpListener::bind("0.0.0.0:0").map_err(|e| format!("tcp: {e}"))?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     {
-        let (crypt, tx) = (crypt.clone(), tx.clone());
+        let (crypt, tx, live) = (crypt.clone(), tx.clone(), live.clone());
         std::thread::spawn(move || {
-            for s in listener.incoming().flatten() {
-                let (crypt, tx) = (crypt.clone(), tx.clone());
+            for mut s in listener.incoming().flatten() {
+                let (crypt, tx, live) = (crypt.clone(), tx.clone(), live.clone());
                 std::thread::spawn(move || {
-                    let Some((who, bundle)) = recv_bundle(s, &crypt) else { return };
-                    let f = runtime().join(format!("{}.bundle", safe(&who)));
-                    if std::fs::write(&f, bundle).is_ok() {
-                        let _ = tx.send(Ev::Bundle(who, f));
+                    let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
+                    let Some((kind, who, payload)) = read_frame(&mut s, &crypt) else { return };
+                    match kind {
+                        BUNDLE => {
+                            let f = runtime().join(format!("{}.bundle", safe(&who)));
+                            if std::fs::write(&f, payload).is_ok() {
+                                let _ = tx.send(Ev::Bundle(who, f));
+                            }
+                        }
+                        HELLO => {
+                            let Ok(w) = s.try_clone() else { return };
+                            let _ = w.set_write_timeout(Some(Duration::from_secs(10)));
+                            let _ = s.set_nodelay(true);
+                            if let Ok(mut l) = live.lock() {
+                                l.end();
+                                l.conn = Some((who.clone(), Arc::new(Mutex::new(w))));
+                                l.leader = true;
+                            }
+                            let _ = tx.send(Ev::Hello(who));
+                            reader(s, live, tx);
+                        }
+                        _ => {}
                     }
                 });
             }
         });
     }
     // anunciarse y buscar a las demás
-    let mdns = mdns(&repo.host, port, &crypt.group, peers.clone(), tx.clone());
+    let mdns = mdns(&me, port, &crypt.group, peers.clone(), tx.clone());
     if let Err(e) = &mdns {
         eprintln!("nota sync: mDNS: {e}");
     }
+    {
+        let (live, dir) = (live.clone(), dir.clone());
+        std::thread::spawn(move || watch(live, dir));
+    }
 
-    let mut st = Status { peers: vec![], last_sync: None, remote: None, error: None };
+    let mut st = Status { peers: vec![], live: None, last_sync: None, remote: None, error: None };
     let mut seen = newest(&dir);
     let mut pending: Option<Instant> = None;
     let mut last_remote = Instant::now() - REMOTE_EVERY;
+    let mut last_dial = Instant::now() - Duration::from_secs(10);
     let mut push_due = true;
     // al arrancar: lo que se haya quedado sin commit
     repo.commit();
+
+    let live_peer = || live.lock().ok().and_then(|l| l.peer());
+    let is_on = || live.lock().map(|l| l.on).unwrap_or(false);
 
     loop {
         let mut send_all = false;
@@ -450,21 +891,77 @@ fn daemon() -> R<()> {
                 // alguien nuevo en la red: que tenga lo nuestro
                 send_to(&repo, &crypt, &peers, Some(&who));
             }
+            Ok(Ev::Hello(who)) => {
+                // la otra quiere estar en vivo: primero emparejarse por git
+                repo.commit();
+                give(&repo, &live, &crypt, &peers, &who);
+                st.live = Some(who);
+            }
+            Ok(Ev::Ready(head)) => {
+                // (aquí se arbitra) la otra ya tiene lo mismo: en vivo
+                if head == repo.head() {
+                    if let Ok(mut l) = live.lock() {
+                        l.start();
+                    }
+                } else if let Some(p) = live_peer() {
+                    give(&repo, &live, &crypt, &peers, &p);
+                }
+            }
+            Ok(Ev::Gone) => st.live = None,
             Ok(Ev::Bundle(who, f)) => {
-                if repo.fetch_bundle(&f, &who) && repo.merge(&format!("refs/remotes/{}/main", safe(&who)), &who) {
-                    seen = newest(&dir);
-                    push_due = true;
-                    st.last_sync = Some(SystemTime::now());
-                    // si hubo que juntar, la otra también debe quedar igual
-                    let theirs = repo.text(&["rev-parse", &format!("refs/remotes/{}/main", safe(&who))]);
-                    if theirs != repo.head() {
-                        send_to(&repo, &crypt, &peers, Some(&who));
+                if repo.fetch_bundle(&f, &who) {
+                    let theirs_ref = format!("refs/remotes/{}/main", safe(&who));
+                    if repo.merge(&theirs_ref, &who) {
+                        seen = newest(&dir);
+                        push_due = true;
+                        st.last_sync = Some(SystemTime::now());
+                    }
+                    let theirs = repo.text(&["rev-parse", &theirs_ref]);
+                    let same = theirs == repo.head() || repo.git(&["merge-base", "--is-ancestor", "HEAD", &theirs_ref]).ok;
+                    let handshake = live_peer().as_deref() == Some(who.as_str()) && !is_on();
+                    let leader = live.lock().map(|l| l.leader).unwrap_or(false);
+                    if !same {
+                        // si hubo que juntar, la otra también debe quedar igual
+                        give(&repo, &live, &crypt, &peers, &who);
+                    } else if handshake && leader {
+                        if let Ok(mut l) = live.lock() {
+                            l.start();
+                        }
+                    } else if handshake
+                        && let Ok(mut l) = live.lock()
+                    {
+                        let h = repo.head();
+                        l.send(READY, h.as_bytes());
                     }
                 }
                 let _ = std::fs::remove_file(f);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(_) => break,
+        }
+
+        // conectarse en vivo con la que arbitra (la que va primero por nombre)
+        if live_peer().is_none() && last_dial.elapsed() > Duration::from_secs(3) {
+            last_dial = Instant::now();
+            let target = peers.lock().ok().and_then(|p| p.iter().filter(|(k, _)| k.as_str() < me.as_str()).min_by(|a, b| a.0.cmp(b.0)).map(|(k, v)| (k.clone(), v.clone())));
+            if let Some((who, addrs)) = target
+                && let Some(mut s) = addrs.iter().find_map(|a| TcpStream::connect_timeout(a, Duration::from_secs(2)).ok())
+            {
+                let _ = s.set_nodelay(true);
+                if write_frame(&mut s, &crypt, HELLO, &me, &[]).is_ok()
+                    && let Ok(w) = s.try_clone()
+                {
+                    let _ = w.set_write_timeout(Some(Duration::from_secs(10)));
+                    if let Ok(mut l) = live.lock() {
+                        l.end();
+                        l.conn = Some((who.clone(), Arc::new(Mutex::new(w))));
+                        l.leader = false;
+                    }
+                    st.live = Some(who);
+                    let (live, tx) = (live.clone(), tx.clone());
+                    std::thread::spawn(move || reader(s, live, tx));
+                }
+            }
         }
 
         // ¿cambió algo aquí?
@@ -516,10 +1013,27 @@ fn daemon() -> R<()> {
         let mut names: Vec<String> = peers.lock().map(|p| p.keys().cloned().collect()).unwrap_or_default();
         names.sort();
         st.peers = names;
+        if !is_on() && st.live.is_some() && live_peer().is_none() {
+            st.live = None;
+        }
         st.write();
     }
     drop(mdns);
     Ok(())
+}
+
+/// Lo nuestro a esa compu: por la conexión en vivo si es con ella (puede que
+/// todavía no la hayamos visto por mDNS), si no como siempre.
+fn give(repo: &Repo, live: &Arc<Mutex<Live>>, crypt: &Arc<Crypt>, peers: &Peers, who: &str) {
+    if let Ok(mut l) = live.lock()
+        && l.peer().as_deref() == Some(who)
+    {
+        if let Some(b) = repo.bundle() {
+            l.send(BUNDLE, &b);
+        }
+        return;
+    }
+    send_to(repo, crypt, peers, Some(who));
 }
 
 /// Mandar lo nuestro a una compu (o a todas).
@@ -598,7 +1112,7 @@ fn mdns(me: &str, port: u16, group: &str, peers: Peers, tx: Sender<Ev>) -> R<Mdn
 fn init(url: &str) -> R<()> {
     let dir = store::shared();
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let repo = Repo { dir: dir.clone(), host: host() };
+    let repo = Repo { dir: dir.clone(), host: host(), live: None };
     if !ready(&dir) {
         let o = repo.git(&["init", "-q", "-b", "main"]);
         if !o.ok {
@@ -656,7 +1170,7 @@ fn status() -> R<()> {
         );
         return Ok(());
     }
-    let repo = Repo { dir: dir.clone(), host: host() };
+    let repo = Repo { dir: dir.clone(), host: host(), live: None };
     println!("{}  {}", l("carpeta", "folder "), dir.display());
     println!("{}   {}", l("repo  ", "repo  "), repo.text(&["remote", "get-url", "origin"]));
     let v: serde_json::Value = std::fs::read_to_string(status_file()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
@@ -666,6 +1180,9 @@ fn status() -> R<()> {
         return Ok(());
     }
     let peers: Vec<&str> = v["peers"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
+    if let Some(w) = v["live"].as_str() {
+        println!("{}  {w}", l("en vivo  ", "live    "));
+    }
     println!(
         "{}  {}",
         l("en la red", "on LAN  "),
