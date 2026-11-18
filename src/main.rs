@@ -10,6 +10,7 @@ mod gfx;
 mod gui;
 mod images;
 mod store;
+mod sync;
 mod tui;
 
 use std::io::Read;
@@ -55,8 +56,13 @@ nota: las notas de discada
   nota -- TEXTO…       lo mismo, aunque TEXTO empiece como un comando
   nota list            las notas: título<TAB>ruta, la última primero
   nota dir             la carpeta de las notas
+  nota share NOTA      compartirla con tus otras compus (otra vez: dejar de)
+  nota sync            el que sincroniza las compartidas, de fondo (discada lo arranca)
+  nota sync init URL   ligar las compartidas a un repo privado (una vez en cada compu)
+  nota sync status     con quién se está hablando y cuándo fue lo último
 
 Si lo apuntado empieza con \"# título\", va a una nota aparte con ese nombre.
+Las compartidas viven en Compartidas/ (en una nota: Ctrl+Shift+S).
 Las notas son archivos .md en {} (NOTA_DIR la cambia).",
             dir.display()
         )
@@ -76,8 +82,13 @@ nota: discada's notes
   nota -- TEXT…        the same, even if TEXT looks like a command
   nota list            the notes: title<TAB>path, newest first
   nota dir             the notes folder
+  nota share NOTE      share it with your other computers (again: unshare)
+  nota sync            the background syncer for shared notes (discada starts it)
+  nota sync init URL   tie shared notes to a private repo (once per computer)
+  nota sync status     who it's talking to and when it last synced
 
 If the note starts with \"# title\", it goes to its own note with that name.
+Shared notes live in Shared/ (in a note: Ctrl+Shift+S).
 Notes are .md files in {} (NOTA_DIR changes it).",
             dir.display()
         )
@@ -108,6 +119,22 @@ fn run(a: &[String]) -> R<()> {
             }
             Ok(())
         }
+        Some("sync") => sync::run(&a[1..]),
+        Some("share") if a.len() >= 2 => {
+            let name = a[1..].join(" ");
+            let p = PathBuf::from(&name);
+            let p = if p.exists() {
+                p
+            } else {
+                store::list()
+                    .into_iter()
+                    .find(|n| n.title == name || n.path.file_stem().is_some_and(|s| s.to_string_lossy() == name))
+                    .map(|n| n.path)
+                    .ok_or_else(|| format!("{}: {name}", l("no hay tal nota", "no such note")))?
+            };
+            saved(&store::toggle_shared(&p)?);
+            Ok(())
+        }
         Some("dir") if a.len() == 1 => {
             println!("{}", store::dir().display());
             Ok(())
@@ -130,7 +157,7 @@ fn run(a: &[String]) -> R<()> {
             saved(&store::add(&a[1..].join(" "))?);
             Ok(())
         }
-        Some(s) if s.starts_with('-') || ["capture", "list", "dir", "new", "restore", "open", "tui"].contains(&s) => {
+        Some(s) if s.starts_with('-') || ["capture", "list", "dir", "new", "restore", "open", "tui", "share"].contains(&s) => {
             eprintln!("{}", usage());
             std::process::exit(2);
         }

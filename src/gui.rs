@@ -12,6 +12,7 @@
 //!   Ctrl+C/X/V copiar, cortar, pegar (una imagen o archivos de imagen también)
 //!   Ctrl+Z / Ctrl+Shift+Z deshacer, rehacer · Ctrl+A todo · F2 renombrar
 //!   Ctrl+N otra nota · Ctrl+L la lista · Ctrl+P fijar · Ctrl+W cerrar
+//!   Ctrl+Shift+S compartir con tus otras compus (o dejar de)
 //!   el título se arrastra para moverla; las orillas, para cambiarle el tamaño
 
 use crate::doc::Doc;
@@ -355,8 +356,8 @@ fn clip_set(s: &str) {
 }
 
 /// Guardar una imagen en attachments/ de las notas: el renglón y la ruta.
-fn save_image(bytes: &[u8], ext: &str) -> R<(String, PathBuf)> {
-    let dir = store::dir().join("attachments");
+fn save_image(bytes: &[u8], ext: &str, note_dir: &Path) -> R<(String, PathBuf)> {
+    let dir = store::attachments_for(note_dir);
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let t = store::local(SystemTime::now());
     let base = format!("nota-{}{:02}{:02}-{:02}{:02}", t.year, t.month, t.day, t.hour, t.min);
@@ -614,6 +615,29 @@ impl App {
         }
     }
 
+    fn toggle_shared(&mut self, i: usize) {
+        if let Some(st) = self.wins[i].sticky() {
+            st.dirty = Some(Instant::now() - Duration::from_secs(5));
+        }
+        self.save(i);
+        let Some(st) = self.wins[i].sticky() else { return };
+        let Some(p) = st.path.clone() else { return };
+        match store::toggle_shared(&p) {
+            Ok(np) => {
+                if let Some(d) = np.parent() {
+                    st.doc.set_dir(d);
+                }
+                st.mtime = std::fs::metadata(&np).and_then(|m| m.modified()).ok();
+                st.path = Some(np);
+                let t = self.wins[i].title();
+                self.wins[i].window.set_title(t);
+                self.save_state();
+                self.redraw(i);
+            }
+            Err(e) => eprintln!("nota: {e}"),
+        }
+    }
+
     fn toggle_pin(&mut self, i: usize) {
         if self.wins[i].address.is_none() {
             self.poll_hypr();
@@ -855,6 +879,10 @@ impl App {
             }
             Keysym::p if ctrl => {
                 return self.toggle_pin(i);
+            }
+            // Ctrl+Shift+S: compartir con tus otras compus (o dejar de)
+            Keysym::s | Keysym::S if ctrl && shift => {
+                return self.toggle_shared(i);
             }
             Keysym::s if ctrl => {
                 st.dirty = Some(Instant::now() - Duration::from_secs(5));
@@ -1188,7 +1216,7 @@ fn paste(doc: &mut Doc, fonts: &mut cosmic_text::FontSystem, font: &gfx::Font) {
             "image/bmp" => "bmp",
             _ => "png",
         };
-        match save_image(&bytes, ext) {
+        match save_image(&bytes, ext, &doc.dir().to_path_buf()) {
             Ok((line, path)) => doc.insert_image(line, path, fonts, font),
             Err(e) => eprintln!("nota: {e}"),
         }
@@ -1202,7 +1230,7 @@ fn paste(doc: &mut Doc, fonts: &mut cosmic_text::FontSystem, font: &gfx::Font) {
             for p in paths {
                 let ext = image_ext(&p).unwrap_or_default();
                 if let Ok(bytes) = std::fs::read(&p)
-                    && let Ok((line, path)) = save_image(&bytes, &ext)
+                    && let Ok((line, path)) = save_image(&bytes, &ext, &doc.dir().to_path_buf())
                 {
                     doc.insert_image(line, path, fonts, font);
                 }
@@ -1718,7 +1746,7 @@ impl App {
             for p in paths {
                 let temp = p.starts_with(&cache);
                 match image_ext(&p) {
-                    Some(ext) => match std::fs::read(&p).map_err(|e| e.to_string()).and_then(|b| save_image(&b, &ext)) {
+                    Some(ext) => match std::fs::read(&p).map_err(|e| e.to_string()).and_then(|b| save_image(&b, &ext, &doc.dir().to_path_buf())) {
                         Ok((line, path)) => doc.insert_image(line, path, fonts, font),
                         Err(e) => eprintln!("nota: {e}"),
                     },
@@ -1736,7 +1764,7 @@ impl App {
                 "webp" | "gif" | "bmp" => t,
                 _ => "png",
             };
-            match save_image(data, ext) {
+            match save_image(data, ext, &doc.dir().to_path_buf()) {
                 Ok((line, path)) => doc.insert_image(line, path, fonts, font),
                 Err(e) => eprintln!("nota: {e}"),
             }

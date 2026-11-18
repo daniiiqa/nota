@@ -10,6 +10,9 @@ disco = { git = "https://github.com/daniiiqa/disco", features = ["paint"] }
 cosmic-text = "0.19.0"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
 libc = "0.2"
+chacha20poly1305 = "0.10"
+mdns-sd = "0.21"
+sha2 = "0.10"
 ratatui = "0.29"
 serde_json = "1"
 smithay-client-toolkit = { version = "0.21", default-features = false, features = ["calloop", "xkbcommon"] }

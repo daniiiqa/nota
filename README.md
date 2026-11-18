@@ -34,7 +34,7 @@ En discada: **SUPER+N** nota nueva, **SUPER+ALT+N** la lista. Al entrar,
   Clic en una imagen la elige; Retroceso o Supr la quitan.
 - Ctrl+Z / Ctrl+Shift+Z deshacer y rehacer · Ctrl+C/X copiar, cortar ·
   Ctrl+A todo · Ctrl+Inicio/Fin el principio o el final · Ctrl+P fijar ·
-  Ctrl+N otra · Ctrl+L la lista · Ctrl+W cerrar. Una nota nueva que se cierra
+  Ctrl+N otra · Ctrl+L la lista · Ctrl+W cerrar · Ctrl+Shift+S compartir. Una nota nueva que se cierra
   vacía no se queda.
 
 La lista: escribir busca (en el título y en el texto), Enter o clic abre,
@@ -57,6 +57,32 @@ Obsidian, así que la misma carpeta:
 
 Lo que cambie por fuera aparece solo en la ventana abierta. Lo borrado va a
 `.trash/` (la misma basura que Obsidian).
+
+## Compartidas entre tus compus
+
+Las notas de `Compartidas/` (`Shared/` en inglés) se sincronizan solas entre
+tus compus. **Ctrl+Shift+S** en una nota (o `nota share NOTA`) la mueve ahí,
+con sus imágenes; otra vez, la regresa.
+
+`nota sync` las cuida de fondo (discada lo arranca al entrar):
+
+- cuando dejas de escribir (3 s), commit;
+- en la misma red se lo manda directo a tus otras compus: se encuentran por
+  mDNS, como picha, y lo que viaja va cifrado (ChaCha20-Poly1305) con la clave
+  que vive en el repo (`.nota/clave`), así que solo tus compus se entienden;
+- y lo empuja a un repo privado (y lo trae cada 45 s), para cuando no se ven.
+
+Si las dos compus cambiaron lo mismo no se pierde nada: se queda lo de aquí y
+lo de la otra va al lado, «nota (conflicto senjougahara).md». Todo queda en el
+historial de git.
+
+Para empezar, una vez:
+
+```bash
+gh repo create notas --private          # el repo, privado
+nota sync init https://github.com/TU_USUARIO/notas.git   # en cada compu
+nota sync status                        # con quién habla y cuándo fue lo último
+```
 
 El idioma sale de `LANGUAGE=` en `~/.config/hypr/discada.conf`. Para pegar
 imágenes hace falta `wl-clipboard`.

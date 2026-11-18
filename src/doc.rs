@@ -503,6 +503,15 @@ impl Doc {
     }
 
     /// Meter una imagen donde está el cursor (el renglón se parte).
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// la nota se movió (compartir): de dónde salen sus imágenes
+    pub fn set_dir(&mut self, dir: &Path) {
+        self.dir = dir.to_path_buf();
+    }
+
     pub fn insert_image(&mut self, line: String, path: PathBuf, fonts: &mut FontSystem, font: &Font) {
         self.snapshot(true);
         let i = self.focus;

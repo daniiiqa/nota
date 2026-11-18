@@ -124,6 +124,55 @@ pub fn trash(path: &Path) -> R<()> {
     fs::rename(path, &to).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// La carpeta de las notas compartidas entre tus compus (la cuida `nota
+/// sync`). Si ya hay una con repo, esa, aunque el idioma haya cambiado.
+pub fn shared() -> PathBuf {
+    let d = dir();
+    for name in ["Compartidas", "Shared"] {
+        if d.join(name).join(".git").exists() {
+            return d.join(name);
+        }
+    }
+    d.join(l("Compartidas", "Shared"))
+}
+
+pub fn is_shared(path: &Path) -> bool {
+    path.starts_with(shared())
+}
+
+/// Dónde van las imágenes que se pegan en una nota de esa carpeta: las
+/// compartidas llevan las suyas, para que viajen con ellas.
+pub fn attachments_for(note_dir: &Path) -> PathBuf {
+    if note_dir.starts_with(shared()) { shared() } else { dir() }.join("attachments")
+}
+
+/// Compartir o dejar de compartir: la nota se mueve a la otra carpeta, con
+/// copia de sus imágenes de attachments/ (los renglones quedan igual).
+pub fn toggle_shared(path: &Path) -> R<PathBuf> {
+    let to_shared = !is_shared(path);
+    let (to_dir, att_to) = if to_shared { (shared(), shared().join("attachments")) } else { (dir(), dir().join("attachments")) };
+    mkdir(&to_dir)?;
+    let body = fs::read_to_string(path).unwrap_or_default();
+    let from_dir = path.parent().map(Path::to_path_buf).unwrap_or_else(dir);
+    for line in body.lines() {
+        if let Some(img) = crate::doc::image_ref(line, &from_dir)
+            && img.exists()
+            && img.parent().is_some_and(|p| p.ends_with("attachments"))
+            && let Some(name) = img.file_name()
+        {
+            mkdir(&att_to)?;
+            let dest = att_to.join(name);
+            if !dest.exists() {
+                fs::copy(&img, &dest).map_err(|e| format!("{}: {e}", img.display()))?;
+            }
+        }
+    }
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let to = free(&to_dir, &stem, None);
+    fs::rename(path, &to).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(to)
+}
+
 fn mkdir(d: &Path) -> R<()> {
     fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))
 }
