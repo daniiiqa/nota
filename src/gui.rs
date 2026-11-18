@@ -793,10 +793,40 @@ impl App {
     }
 
     fn layout_now(&mut self, i: usize) {
-        if std::mem::take(&mut self.wins[i].needs_layout) {
-            self.relayout(i);
-            self.follow_cursor(i);
+        if !std::mem::take(&mut self.wins[i].needs_layout) {
+            return;
         }
+        // antes de reacomodar: ¿se veía el cursor?, ¿qué tan abajo ibas?
+        let before = self.view(i);
+        self.relayout(i);
+        match before {
+            // escribiendo: el cursor sigue a la vista
+            Some((_, true)) | None => self.follow_cursor(i),
+            // leyendo más abajo: en el mismo punto de la nota, aunque el
+            // texto se acomode distinto (no de regreso al principio)
+            Some((frac, false)) => {
+                let (_, _, _, ch) = self.content(i);
+                let images = &self.images;
+                let font = &self.text.font;
+                if let Kind::Sticky(st) = &mut self.wins[i].kind {
+                    let total: f32 = st.doc.heights(font, &|p| images.get(p)).iter().sum();
+                    st.scroll = (frac * total).clamp(0.0, (total - ch).max(0.0));
+                }
+            }
+        }
+    }
+
+    /// Qué tan abajo vas (qué parte de la nota está hasta arriba de la vista) y si el cursor se ve.
+    fn view(&self, i: usize) -> Option<(f32, bool)> {
+        let (_, _, _, ch) = self.content(i);
+        let Kind::Sticky(st) = &self.wins[i].kind else { return None };
+        let heights = st.doc.heights(&self.text.font, &|p| self.images.get(p));
+        let total: f32 = heights.iter().sum();
+        // lo de hasta arriba de la vista, como parte de toda la nota (no
+        // depende del alto de la ventana, que es justo lo que cambia)
+        let frac = if total > 0.0 { st.scroll / total } else { 0.0 };
+        let seen = st.doc.cursor_y(&heights).is_some_and(|(y, lh)| y + lh > st.scroll && y < st.scroll + ch);
+        Some((frac, seen))
     }
 
     /// La pantalla pide otro cuadro: la inercia avanza y se dibuja lo pendiente.
