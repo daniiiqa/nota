@@ -37,7 +37,7 @@ use smithay_client_toolkit::data_device_manager::{
 };
 use smithay_client_toolkit::reexports::client::protocol::{wl_data_device::WlDataDevice, wl_data_device_manager::DndAction};
 use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState},
+    compositor::{CompositorHandler, CompositorState, FrameCallbackData},
     delegate_registry,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
@@ -173,6 +173,15 @@ struct Win {
     geom: Option<Geom>,
     /// algo se está arrastrando encima
     drop_on: bool,
+    /// esperando a que la pantalla pida el siguiente cuadro (desde cuándo)
+    frame_at: Option<Instant>,
+    /// algo cambió mientras se esperaba: dibujar en el siguiente cuadro
+    needs_draw: bool,
+    /// el scroll del trackpad: lo último que se movió (para la inercia)
+    swipe: Vec<(Instant, f32)>,
+    /// inercia al soltar los dedos: px/s y cuándo se aplicó por última vez
+    vel: f32,
+    vel_at: Option<Instant>,
 }
 
 impl Win {
@@ -439,7 +448,7 @@ impl App {
         let window = self.xdg.create_window(surface, WindowDecorations::RequestClient, &self.qh);
         window.set_app_id("nota");
         window.set_min_size(Some((200, 120)));
-        let w = Win { window, kind, size, scale: 1, configured: false, pool: None, hover: None, pinned: false, address: None, geom, drop_on: false };
+        let w = Win { window, kind, size, scale: 1, configured: false, pool: None, hover: None, pinned: false, address: None, geom, drop_on: false, frame_at: None, needs_draw: false, swipe: Vec::new(), vel: 0.0, vel_at: None };
         w.window.set_title(w.title());
         w.window.commit();
         self.wins.push(w);
@@ -754,8 +763,46 @@ impl App {
         let surface = window.wl_surface();
         surface.set_buffer_scale(s);
         surface.damage_buffer(0, 0, w, h);
+        surface.frame(&self.qh, FrameCallbackData(surface.clone()));
+        win.frame_at = Some(Instant::now());
+        win.needs_draw = false;
         if buffer.attach_to(surface).is_ok() {
             window.commit();
+        }
+    }
+
+    /// Dibujar al ritmo de la pantalla: si ya hay un cuadro en camino, lo de
+    /// ahora sale en el siguiente (el trackpad manda más de 100 por segundo).
+    fn request(&mut self, i: usize) {
+        // una ventana escondida no pide cuadros: no esperar para siempre
+        let waiting = self.wins[i].frame_at.is_some_and(|t| t.elapsed() < Duration::from_millis(100));
+        if waiting {
+            self.wins[i].needs_draw = true;
+        } else {
+            self.redraw(i);
+        }
+    }
+
+    /// La pantalla pide otro cuadro: la inercia avanza y se dibuja lo pendiente.
+    fn on_frame(&mut self, i: usize) {
+        self.wins[i].frame_at = None;
+        let w = &mut self.wins[i];
+        if w.vel != 0.0 {
+            let now = Instant::now();
+            let dt = w.vel_at.map_or(0.016, |t| (now - t).as_secs_f32()).min(0.05);
+            w.vel_at = Some(now);
+            let step = w.vel * dt;
+            w.vel *= (-dt * 3.5).exp();
+            if w.vel.abs() < 25.0 {
+                w.vel = 0.0;
+            }
+            if !self.scroll_by(i, step) {
+                self.wins[i].vel = 0.0;
+            }
+            self.wins[i].needs_draw = true;
+        }
+        if self.wins[i].needs_draw {
+            self.redraw(i);
         }
     }
 
@@ -1220,26 +1267,66 @@ impl App {
         self.redraw(i);
     }
 
-    fn scroll(&mut self, i: usize, dy: f64, discrete: bool) {
+    /// La rueda (`discrete`, de a 3 renglones) o el trackpad (px; `stop`
+    /// cuando se levantan los dedos: ahí sigue solo con inercia).
+    fn scroll(&mut self, i: usize, dy: f64, discrete: bool, stop: bool) {
         let lh = self.text.font.line() as f64;
-        let px = if discrete { dy * lh * 3.0 } else { dy * 1.5 };
+        let rows = list_rows(self.wins[i].size.1 as f32, &self.text);
+        let now = Instant::now();
+        let w = &mut self.wins[i];
+        if let Kind::List(lw) = &mut w.kind {
+            if dy == 0.0 {
+                return;
+            }
+            // la lista va de renglón en renglón: el trackpad junta antes de mover
+            // (lo que sobra se guarda en `vel`, que la lista no usa para inercia)
+            let acc = if discrete { dy * 3.0 } else { w.vel as f64 + dy / lh };
+            let steps = acc.trunc();
+            w.vel = if discrete { 0.0 } else { (acc - steps) as f32 };
+            let max_top = lw.matches.len().saturating_sub(rows);
+            lw.top = (lw.top as isize + steps as isize).clamp(0, max_top as isize) as usize;
+            if steps != 0.0 {
+                self.request(i);
+            }
+            return;
+        }
+        let w = &mut self.wins[i];
+        if stop {
+            // los dedos se levantaron: la velocidad de los últimos ~80 ms sigue
+            w.swipe.retain(|(t, _)| now - *t < Duration::from_millis(80));
+            let moved: f32 = w.swipe.iter().map(|(_, p)| p).sum();
+            let span = w.swipe.first().map_or(0.0, |(t, _)| (now - *t).as_secs_f32()).max(0.016);
+            w.vel = if w.swipe.len() >= 2 { (moved / span).clamp(-6000.0, 6000.0) } else { 0.0 };
+            w.vel_at = Some(now);
+            w.swipe.clear();
+            if w.vel != 0.0 {
+                self.request(i);
+            }
+            return;
+        }
+        // tocar otra vez para la inercia
+        w.vel = 0.0;
+        let px = if discrete { (dy * lh * 3.0) as f32 } else { dy as f32 * 1.5 };
+        if !discrete {
+            w.swipe.push((now, px));
+            w.swipe.retain(|(t, _)| now - *t < Duration::from_millis(120));
+        }
+        if self.scroll_by(i, px) {
+            self.request(i);
+        }
+    }
+
+    /// Mover el texto `px` (lógicos). false si ya no se puede (llegó a la orilla).
+    fn scroll_by(&mut self, i: usize, px: f32) -> bool {
         let (_, _, _, ch) = self.content(i);
         let s = self.wins[i].scale.max(1) as f32;
         let images = &self.images;
         let font = &self.text.font;
-        let rows = list_rows(self.wins[i].size.1 as f32, &self.text);
-        match &mut self.wins[i].kind {
-            Kind::Sticky(st) => {
-                let total: f32 = st.doc.heights(font, &|p| images.get(p)).iter().sum();
-                st.scroll = (st.scroll + px as f32 * s).clamp(0.0, (total - ch).max(0.0));
-            }
-            Kind::List(lw) => {
-                let d = if dy > 0.0 { 1 } else { -1 };
-                let max_top = lw.matches.len().saturating_sub(rows);
-                lw.top = (lw.top as isize + d * if discrete { 3 } else { 1 }).clamp(0, max_top as isize) as usize;
-            }
-        }
-        self.redraw(i);
+        let Kind::Sticky(st) = &mut self.wins[i].kind else { return false };
+        let total: f32 = st.doc.heights(font, &|p| images.get(p)).iter().sum();
+        let before = st.scroll;
+        st.scroll = (st.scroll + px * s).clamp(0.0, (total - ch).max(0.0));
+        st.scroll != before
     }
 }
 
@@ -1581,7 +1668,11 @@ impl CompositorHandler for App {
         }
     }
     fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
+    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, surface: &wl_surface::WlSurface, _: u32) {
+        if let Some(i) = self.win_of(surface) {
+            self.on_frame(i);
+        }
+    }
     fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
     fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
 }
@@ -1688,9 +1779,15 @@ impl PointerHandler for App {
                 PointerEventKind::Release { button: BTN_LEFT, .. } => self.dragging = false,
                 PointerEventKind::Axis { vertical, .. } => {
                     if vertical.discrete != 0 {
-                        self.scroll(i, vertical.discrete as f64, true);
-                    } else if vertical.absolute != 0.0 {
-                        self.scroll(i, vertical.absolute, false);
+                        self.scroll(i, vertical.discrete as f64, true, false);
+                    } else {
+                        if vertical.absolute != 0.0 {
+                            self.scroll(i, vertical.absolute, false, false);
+                        }
+                        // puede llegar junto con el último movimiento
+                        if vertical.stop {
+                            self.scroll(i, 0.0, false, true);
+                        }
                     }
                 }
                 _ => {}
