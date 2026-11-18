@@ -177,6 +177,8 @@ struct Win {
     frame_at: Option<Instant>,
     /// algo cambió mientras se esperaba: dibujar en el siguiente cuadro
     needs_draw: bool,
+    /// cambió de tamaño: reacomodar el texto antes de dibujar
+    needs_layout: bool,
     /// el scroll del trackpad: lo último que se movió (para la inercia)
     swipe: Vec<(Instant, f32)>,
     /// inercia al soltar los dedos: px/s y cuándo se aplicó por última vez
@@ -448,7 +450,7 @@ impl App {
         let window = self.xdg.create_window(surface, WindowDecorations::RequestClient, &self.qh);
         window.set_app_id("nota");
         window.set_min_size(Some((200, 120)));
-        let w = Win { window, kind, size, scale: 1, configured: false, pool: None, hover: None, pinned: false, address: None, geom, drop_on: false, frame_at: None, needs_draw: false, swipe: Vec::new(), vel: 0.0, vel_at: None };
+        let w = Win { window, kind, size, scale: 1, configured: false, pool: None, hover: None, pinned: false, address: None, geom, drop_on: false, frame_at: None, needs_draw: false, needs_layout: false, swipe: Vec::new(), vel: 0.0, vel_at: None };
         w.window.set_title(w.title());
         w.window.commit();
         self.wins.push(w);
@@ -779,7 +781,15 @@ impl App {
         if waiting {
             self.wins[i].needs_draw = true;
         } else {
+            self.layout_now(i);
             self.redraw(i);
+        }
+    }
+
+    fn layout_now(&mut self, i: usize) {
+        if std::mem::take(&mut self.wins[i].needs_layout) {
+            self.relayout(i);
+            self.follow_cursor(i);
         }
     }
 
@@ -799,6 +809,10 @@ impl App {
             if !self.scroll_by(i, step) {
                 self.wins[i].vel = 0.0;
             }
+            self.wins[i].needs_draw = true;
+        }
+        if self.wins[i].needs_layout {
+            self.layout_now(i);
             self.wins[i].needs_draw = true;
         }
         if self.wins[i].needs_draw {
@@ -1644,15 +1658,21 @@ impl WindowHandler for App {
         let resized = size != w.size;
         w.size = size;
         w.configured = true;
+        // al estirarla llegan configures a la velocidad del mouse: se
+        // reacomoda una vez por cuadro de pantalla, con el tamaño más nuevo
+        // (la memoria de dibujo crece sola, no se vuelve a crear)
         if resized || first {
-            w.pool = None;
-            self.relayout(i);
-            self.follow_cursor(i);
+            w.needs_layout = true;
         }
-        if first && let Some(g) = self.wins[i].geom {
-            place(self.wins[i].title(), g);
+        if first {
+            self.layout_now(i);
+            if let Some(g) = self.wins[i].geom {
+                place(self.wins[i].title(), g);
+            }
+            self.redraw(i);
+        } else {
+            self.request(i);
         }
-        self.redraw(i);
     }
 }
 
