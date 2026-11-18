@@ -3,7 +3,7 @@
 
 use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
 use disco::look::Look;
-use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, PixmapPaint, Rect, Transform};
+use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, PixmapMut, PixmapPaint, Rect, Transform};
 
 /// Los colores del look, ya listos para dibujar.
 #[derive(Clone, Copy)]
@@ -122,13 +122,24 @@ pub struct Clip {
 }
 
 impl Clip {
-    pub fn all(pix: &Pixmap) -> Clip {
+    pub fn all(pix: &PixmapMut) -> Clip {
         Clip { x0: 0, y0: 0, x1: pix.width() as i32, y1: pix.height() as i32 }
     }
 }
 
+/// Todo de un color (el fondo): se escribe tal cual, sin mezclar, que es lo
+/// más rápido. Va primero en cada cuadro.
+pub fn clear(pix: &mut PixmapMut, c: Color) {
+    let a = c.a() as u32;
+    let pre = |v: u8| ((v as u32 * a + 127) / 255) as u8;
+    let px = [pre(c.r()), pre(c.g()), pre(c.b()), c.a()];
+    for d in pix.data_mut().as_chunks_mut::<4>().0 {
+        *d = px;
+    }
+}
+
 /// Un rectángulo de color encima de lo que haya (alfa premultiplicado).
-pub fn fill(pix: &mut Pixmap, x: i32, y: i32, w: u32, h: u32, c: Color, clip: Clip) {
+pub fn fill(pix: &mut PixmapMut, x: i32, y: i32, w: u32, h: u32, c: Color, clip: Clip) {
     let a = c.a() as u32;
     if a == 0 {
         return;
@@ -165,7 +176,7 @@ pub fn fill(pix: &mut Pixmap, x: i32, y: i32, w: u32, h: u32, c: Color, clip: Cl
 }
 
 /// Un rectángulo redondeado relleno (el fondo de la nota, el de la imagen elegida).
-pub fn rounded(pix: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, r: f32, c: Color) {
+pub fn rounded(pix: &mut PixmapMut, x: f32, y: f32, w: f32, h: f32, r: f32, c: Color) {
     let Some(path) = rounded_path(x, y, w, h, r) else { return };
     let mut p = Paint::default();
     p.set_color_rgba8(c.r(), c.g(), c.b(), c.a());
@@ -174,7 +185,7 @@ pub fn rounded(pix: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, r: f32, c: Colo
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn stroke(pix: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, r: f32, width: f32, c: Color) {
+pub fn stroke(pix: &mut PixmapMut, x: f32, y: f32, w: f32, h: f32, r: f32, width: f32, c: Color) {
     let Some(path) = rounded_path(x + width / 2.0, y + width / 2.0, w - width, h - width, r) else { return };
     let mut p = Paint::default();
     p.set_color_rgba8(c.r(), c.g(), c.b(), c.a());
@@ -206,7 +217,7 @@ fn rounded_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia::Pat
 }
 
 /// Una imagen escalada a `w`×`h` con su esquina en (x, y).
-pub fn image(pix: &mut Pixmap, img: &Pixmap, x: f32, y: f32, w: f32, h: f32, clip: Clip) {
+pub fn image(pix: &mut PixmapMut, img: &Pixmap, x: f32, y: f32, w: f32, h: f32, clip: Clip) {
     let (sx, sy) = (w / img.width() as f32, h / img.height() as f32);
     let mask_rect = Rect::from_ltrb(clip.x0 as f32, clip.y0 as f32, clip.x1 as f32, clip.y1 as f32);
     let mut mask = None;
@@ -269,7 +280,7 @@ impl Text {
 
     /// Dibuja `s` con la caja de su renglón empezando en (x, y).
     #[allow(clippy::too_many_arguments)]
-    pub fn draw(&mut self, pix: &mut Pixmap, s: &str, c: Color, bold: bool, x: f32, y: f32, scale: f32, clip: Clip) {
+    pub fn draw(&mut self, pix: &mut PixmapMut, s: &str, c: Color, bold: bool, x: f32, y: f32, scale: f32, clip: Clip) {
         if s.is_empty() {
             return;
         }

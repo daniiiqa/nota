@@ -342,7 +342,7 @@ impl Doc {
     #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &mut self,
-        pix: &mut Pixmap,
+        pix: &mut tiny_skia::PixmapMut,
         fonts: &mut FontSystem,
         cache: &mut SwashCache,
         font: &Font,

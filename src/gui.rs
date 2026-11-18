@@ -746,28 +746,35 @@ impl App {
         let (window, true) = (self.wins[i].window.clone(), self.wins[i].configured) else { return };
         let s = self.wins[i].scale.max(1);
         let (w, h) = (self.wins[i].size.0 as i32 * s, self.wins[i].size.1 as i32 * s);
-        let Some(mut pix) = Pixmap::new(w.max(1) as u32, h.max(1) as u32) else { return };
-        self.paint(i, &mut pix);
-
+        // la memoria de dibujo sale de la ventana un rato (paint necesita a todo self)
         let shm = &self.shm;
-        let win = &mut self.wins[i];
-        let pool = match &mut win.pool {
+        let mut pool = match self.wins[i].pool.take() {
             Some(p) => p,
-            None => win.pool.insert(SlotPool::new((w * h * 4).max(4) as usize, shm).expect("memoria compartida")),
+            None => SlotPool::new((w * h * 4).max(4) as usize, shm).expect("memoria compartida"),
         };
-        // si la pantalla acepta RGBA tal cual (Abgr8888 en Wayland), se copia de
-        // un jalón; si no, BGRA reacomodando de a 4 bytes
+        // si la pantalla acepta RGBA tal cual (Abgr8888), se dibuja directo en
+        // su memoria: sin lienzo aparte ni copia (a pantalla completa son 2
+        // millones de pixeles por cuadro); si no, en un lienzo y reacomodando
         let direct = shm.formats().contains(&wl_shm::Format::Abgr8888);
         let fmt = if direct { wl_shm::Format::Abgr8888 } else { wl_shm::Format::Argb8888 };
-        let Ok((buffer, canvas)) = pool.create_buffer(w, h, w * 4, fmt) else { return };
+        let Ok((buffer, canvas)) = pool.create_buffer(w, h, w * 4, fmt) else {
+            self.wins[i].pool = Some(pool);
+            return;
+        };
+        let len = (w * h * 4) as usize;
         if direct {
-            canvas[..pix.data().len()].copy_from_slice(pix.data());
-        } else {
+            if let Some(mut pix) = tiny_skia::PixmapMut::from_bytes(&mut canvas[..len], w as u32, h as u32) {
+                self.paint(i, &mut pix);
+            }
+        } else if let Some(mut pix) = Pixmap::new(w.max(1) as u32, h.max(1) as u32) {
+            self.paint(i, &mut pix.as_mut());
             for (dst, src) in canvas.as_chunks_mut::<4>().0.iter_mut().zip(pix.data().as_chunks::<4>().0) {
                 let v = u32::from_le_bytes(*src);
                 *dst = ((v & 0xff00_ff00) | ((v & 0xff) << 16) | ((v >> 16) & 0xff)).to_le_bytes();
             }
         }
+        let win = &mut self.wins[i];
+        win.pool = Some(pool);
         let surface = window.wl_surface();
         surface.set_buffer_scale(s);
         surface.damage_buffer(0, 0, w, h);
@@ -856,13 +863,14 @@ impl App {
         }
     }
 
-    fn paint(&mut self, i: usize, pix: &mut Pixmap) {
+    fn paint(&mut self, i: usize, pix: &mut tiny_skia::PixmapMut) {
         let s = self.wins[i].scale.max(1) as f32;
         let c = self.colors;
         let all = Clip::all(pix);
         let (pw, ph) = (pix.width(), pix.height());
         let focused = self.focused() == Some(i);
-        gfx::fill(pix, 0, 0, pw, ph, gfx::with_alpha(c.bg, c.alpha), all);
+        gfx::clear(pix, gfx::with_alpha(c.bg, c.alpha));
+        let _ = (pw, ph);
 
         // la barra del título
         let (p, bh) = (pad(&self.text) * s, bar_h(&self.text) * s);
@@ -1466,7 +1474,7 @@ fn list_rows(h: f32, text: &Text) -> usize {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn paint_list(lw: &ListWin, pix: &mut Pixmap, text: &mut Text, c: &Colors, look: &Look, s: f32, cx: f32, cy: f32, cw: f32, _ch: f32, focused: bool) {
+fn paint_list(lw: &ListWin, pix: &mut tiny_skia::PixmapMut, text: &mut Text, c: &Colors, look: &Look, s: f32, cx: f32, cy: f32, cw: f32, _ch: f32, focused: bool) {
     let clip = Clip::all(pix);
     let lh = text.font.line() * s;
     // la búsqueda
