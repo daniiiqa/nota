@@ -755,12 +755,18 @@ impl App {
             Some(p) => p,
             None => win.pool.insert(SlotPool::new((w * h * 4).max(4) as usize, shm).expect("memoria compartida")),
         };
-        let Ok((buffer, canvas)) = pool.create_buffer(w, h, w * 4, wl_shm::Format::Argb8888) else { return };
-        for (dst, src) in canvas.as_chunks_mut::<4>().0.iter_mut().zip(pix.data().as_chunks::<4>().0) {
-            dst[0] = src[2];
-            dst[1] = src[1];
-            dst[2] = src[0];
-            dst[3] = src[3];
+        // si la pantalla acepta RGBA tal cual (Abgr8888 en Wayland), se copia de
+        // un jalón; si no, BGRA reacomodando de a 4 bytes
+        let direct = shm.formats().contains(&wl_shm::Format::Abgr8888);
+        let fmt = if direct { wl_shm::Format::Abgr8888 } else { wl_shm::Format::Argb8888 };
+        let Ok((buffer, canvas)) = pool.create_buffer(w, h, w * 4, fmt) else { return };
+        if direct {
+            canvas[..pix.data().len()].copy_from_slice(pix.data());
+        } else {
+            for (dst, src) in canvas.as_chunks_mut::<4>().0.iter_mut().zip(pix.data().as_chunks::<4>().0) {
+                let v = u32::from_le_bytes(*src);
+                *dst = ((v & 0xff00_ff00) | ((v & 0xff) << 16) | ((v >> 16) & 0xff)).to_le_bytes();
+            }
         }
         let surface = window.wl_surface();
         surface.set_buffer_scale(s);

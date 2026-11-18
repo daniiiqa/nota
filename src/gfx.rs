@@ -129,8 +129,8 @@ impl Clip {
 
 /// Un rectángulo de color encima de lo que haya (alfa premultiplicado).
 pub fn fill(pix: &mut Pixmap, x: i32, y: i32, w: u32, h: u32, c: Color, clip: Clip) {
-    let a = c.a() as f32 / 255.0;
-    if a <= 0.0 {
+    let a = c.a() as u32;
+    if a == 0 {
         return;
     }
     let (x0, y0) = (x.max(clip.x0), y.max(clip.y0));
@@ -139,17 +139,27 @@ pub fn fill(pix: &mut Pixmap, x: i32, y: i32, w: u32, h: u32, c: Color, clip: Cl
         return;
     }
     let pw = pix.width() as usize;
+    // el color ya multiplicado por su alfa (como guarda tiny-skia), en enteros:
+    // esto pinta el fondo entero en cada cuadro, tiene que ser rápido
+    let pre = |v: u8| (v as u32 * a + 127) / 255;
+    let src = [pre(c.r()), pre(c.g()), pre(c.b()), a];
+    let inv = 255 - a;
     let data = pix.data_mut();
-    let (r, g, b) = (c.r() as f32, c.g() as f32, c.b() as f32);
     for yy in y0..y1 {
-        for xx in x0..x1 {
-            let i = (yy as usize * pw + xx as usize) * 4;
-            let d = &mut data[i..i + 4];
-            let over = |src: f32, dst: u8| (src * a + dst as f32 * (1.0 - a)).round().clamp(0.0, 255.0) as u8;
-            d[0] = over(r, d[0]);
-            d[1] = over(g, d[1]);
-            d[2] = over(b, d[2]);
-            d[3] = over(255.0, d[3]);
+        let row = &mut data[(yy as usize * pw + x0 as usize) * 4..(yy as usize * pw + x1 as usize) * 4];
+        if inv == 0 {
+            let px = [src[0] as u8, src[1] as u8, src[2] as u8, 255];
+            for d in row.as_chunks_mut::<4>().0 {
+                *d = px;
+            }
+            continue;
+        }
+        for d in row.as_chunks_mut::<4>().0 {
+            for k in 0..4 {
+                // d·(255−a)/255 redondeado, sin dividir
+                let t = d[k] as u32 * inv + 128;
+                d[k] = (src[k] + ((t + (t >> 8)) >> 8)).min(255) as u8;
+            }
         }
     }
 }
