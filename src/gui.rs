@@ -20,7 +20,9 @@ use crate::gfx::{self, Clip, Colors, Text};
 use crate::images::Images;
 use crate::{R, fuzzy, home, l, store};
 use cosmic_text::{Action, Motion};
+use crate::marco;
 use disco::look::Look;
+use disco::paint::Painter;
 use serde_json::{Value, json};
 use smithay_client_toolkit::reexports::calloop::channel::{self, Event};
 use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
@@ -173,6 +175,8 @@ struct Win {
     geom: Option<Geom>,
     /// algo se está arrastrando encima
     drop_on: bool,
+    /// el marco ya pintado (en tiras) y para qué estado: se rehace si cambia
+    marco: Option<(String, Vec<marco::Tira>)>,
     /// esperando a que la pantalla pida el siguiente cuadro (desde cuándo)
     frame_at: Option<Instant>,
     /// algo cambió mientras se esperaba: dibujar en el siguiente cuadro
@@ -231,6 +235,9 @@ struct App {
     look: Look,
     colors: Colors,
     text: Text,
+    /// las celdas del marco (como las TUI de discada), y cuántas veces cambió el look
+    painter: Painter,
+    look_ver: u64,
     images: Images,
     quit: bool,
     last_poll: Instant,
@@ -244,14 +251,6 @@ struct App {
 }
 
 // ── la cabeza de cada ventana ────────────────────────────────────────────────
-
-/// Alto de la barra del título y orilla, en px lógicos.
-fn bar_h(text: &Text) -> f32 {
-    (text.font.line() * 1.5).round()
-}
-fn pad(text: &Text) -> f32 {
-    (text.font.px * 0.9).round()
-}
 
 fn icon(b: Btn, pinned: bool, icons: bool) -> &'static str {
     match (b, icons) {
@@ -283,18 +282,6 @@ fn buttons(kind: &Kind) -> &'static [Btn] {
         Kind::Sticky(_) => &[Btn::Pin, Btn::New, Btn::List, Btn::Close],
         Kind::List(_) => &[Btn::New, Btn::Close],
     }
-}
-
-/// Dónde cae cada botón (px lógicos, de derecha a izquierda).
-fn button_rects(w: f32, text: &Text, kind: &Kind) -> Vec<(Btn, f32, f32)> {
-    let bw = (text.font.line() * 1.25).round();
-    let mut x = w - pad(text) * 0.5;
-    let mut out = Vec::new();
-    for b in buttons(kind).iter().rev() {
-        x -= bw;
-        out.push((*b, x, bw));
-    }
-    out
 }
 
 // ── el pegamento con Hyprland ────────────────────────────────────────────────
@@ -450,7 +437,7 @@ impl App {
         let window = self.xdg.create_window(surface, WindowDecorations::RequestClient, &self.qh);
         window.set_app_id("nota");
         window.set_min_size(Some((200, 120)));
-        let w = Win { window, kind, size, scale: 1, configured: false, pool: None, hover: None, pinned: false, address: None, geom, drop_on: false, frame_at: None, needs_draw: false, needs_layout: false, swipe: Vec::new(), vel: 0.0, vel_at: None };
+        let w = Win { window, kind, size, scale: 1, configured: false, pool: None, hover: None, pinned: false, address: None, geom, drop_on: false, marco: None, frame_at: None, needs_draw: false, needs_layout: false, swipe: Vec::new(), vel: 0.0, vel_at: None };
         w.window.set_title(w.title());
         w.window.commit();
         self.wins.push(w);
@@ -471,7 +458,8 @@ impl App {
             None => (String::new(), None, true),
         };
         let dir = path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_else(store::dir);
-        let width = (STICKY.0 as f32 - 2.0 * pad(&self.text)).max(50.0);
+        let cw = self.painter.size(100, 1).0 as f32 / 100.0;
+        let width = (STICKY.0 as f32 - 4.0 * cw).max(50.0);
         let doc = Doc::new(&text, &dir, &mut self.text.fonts, &self.text.font, self.colors, width, 1.0);
         let st = Sticky { path, doc, scroll: 0.0, dirty: None, mtime, fresh, renaming: None, base: text };
         let size = geom.map_or(STICKY, |g| (g.w.max(200) as u32, g.h.max(120) as u32));
@@ -630,6 +618,8 @@ impl App {
         }
         if self.look.refresh() {
             self.colors = Colors::of(&self.look);
+            self.painter = Painter::new();
+            self.look_ver += 1;
             self.text = Text::new();
             for i in 0..self.wins.len() {
                 self.relayout(i);
@@ -704,8 +694,8 @@ impl App {
 
     fn relayout(&mut self, i: usize) {
         let s = self.wins[i].scale.max(1) as f32;
-        let w = self.wins[i].size.0 as f32;
-        let width = ((w - 2.0 * pad(&self.text)) * s).max(10.0);
+        let g = self.grid(i);
+        let width = ((g.cols as f32 - 4.0) * g.cw * s).max(10.0);
         let colors = self.colors;
         let Text { fonts, font, .. } = &mut self.text;
         if let Kind::Sticky(st) = &mut self.wins[i].kind {
@@ -714,12 +704,18 @@ impl App {
     }
 
     /// El área del texto, en px físicos: (x, y, ancho, alto).
+    /// Adentro del recuadro, con una celda de aire a los lados.
     fn content(&self, i: usize) -> (f32, f32, f32, f32) {
         let s = self.wins[i].scale.max(1) as f32;
-        let (w, h) = (self.wins[i].size.0 as f32 * s, self.wins[i].size.1 as f32 * s);
-        let (p, bh) = (pad(&self.text) * s, bar_h(&self.text) * s);
-        let y = bh + p * 0.4;
-        (p, y, (w - 2.0 * p).max(1.0), (h - y - p * 0.6).max(1.0))
+        let g = self.grid(i);
+        let aire = (0.15 * g.ch * s).round();
+        let (x, y) = ((g.ox + 2.0 * g.cw) * s, (g.oy + g.ch) * s + aire);
+        (x, y, ((g.cols as f32 - 4.0) * g.cw * s).max(1.0), ((g.rows as f32 - 2.0) * g.ch * s - aire).max(1.0))
+    }
+
+    /// La cuadrícula de celdas de la ventana (px lógicos).
+    fn grid(&self, i: usize) -> marco::Grid {
+        marco::Grid::of(&self.painter, self.wins[i].size.0 as f32, self.wins[i].size.1 as f32)
     }
 
     /// Que el cursor quede a la vista.
@@ -866,85 +862,67 @@ impl App {
     fn paint(&mut self, i: usize, pix: &mut tiny_skia::PixmapMut) {
         let s = self.wins[i].scale.max(1) as f32;
         let c = self.colors;
-        let all = Clip::all(pix);
-        let (pw, ph) = (pix.width(), pix.height());
+        let pw = pix.width();
         let focused = self.focused() == Some(i);
         gfx::clear(pix, gfx::with_alpha(c.bg, c.alpha));
-        let _ = (pw, ph);
 
-        // la barra del título
-        let (p, bh) = (pad(&self.text) * s, bar_h(&self.text) * s);
-        let lh = self.text.font.line() * s;
-        gfx::fill(pix, 0, 0, pw, bh as u32, gfx::with_alpha(c.border, 0.25), all);
-        gfx::fill(pix, 0, bh as i32, pw, s as u32, gfx::with_alpha(c.border, 0.8), all);
-        let btns = button_rects(self.wins[i].size.0 as f32, &self.text, &self.wins[i].kind);
-        let left_of_btns = btns.last().map_or(pw as f32, |b| b.1 * s);
-        let ty = (bh - lh) / 2.0;
+        // el marco como TUI: recuadro del look, título y botones en el borde
+        let g = self.grid(i);
         let renaming = match &self.wins[i].kind {
             Kind::Sticky(st) => st.renaming.clone(),
             _ => None,
         };
-        let tcol = if focused { c.primary } else { c.muted };
-        match renaming {
-            Some(r) => {
-                let shown = format!("{r}▏");
-                self.text.draw(pix, &shown, c.fg, true, p, ty, s, all);
-            }
-            None => {
-                let title = self.look.tx(&self.wins[i].title());
-                let t = self.text.fit(&title, true, s, left_of_btns - p * 1.5);
-                self.text.draw(pix, &t, tcol, true, p, ty, s, all);
-            }
-        }
+        let titulo = match renaming {
+            Some(r) => format!("{r}▏"),
+            None => self.look.tx(&self.wins[i].title()),
+        };
         let (hover, pinned) = (self.wins[i].hover, self.wins[i].pinned);
-        for (b, x, bw) in btns {
-            let g = icon(b, pinned, self.look.icons);
-            let col = if hover == Some(b) {
-                if b == Btn::Close { c.red } else { c.fg }
-            } else if b == Btn::Pin && pinned {
-                c.primary
-            } else {
-                c.muted
+        let resalta = focused || self.wins[i].drop_on;
+        let es_lista = matches!(self.wins[i].kind, Kind::List(_));
+        // la nota: solo las orillas, guardadas mientras nada de esto cambie
+        // (el texto se dibuja aparte, como siempre); la lista va entera
+        let clave = format!("{}x{}@{s}|{titulo}|{resalta}|{hover:?}|{pinned}|{}", g.cols, g.rows, self.look_ver);
+        let al_dia = !es_lista && self.wins[i].marco.as_ref().is_some_and(|(k, _)| *k == clave);
+        if !al_dia {
+            let btns: Vec<(Btn, &str)> = buttons(&self.wins[i].kind).iter().map(|b| (*b, icon(*b, pinned, self.look.icons))).collect();
+            let mut buf = marco::recuadro(&self.look, &g, &titulo, resalta, &btns, hover, pinned.then_some(Btn::Pin), Some(Btn::Close));
+            let tiras = match &self.wins[i].kind {
+                Kind::List(lw) => {
+                    celdas_lista(lw, &mut buf, &self.look, focused);
+                    marco::tira(&mut self.painter, &buf, &self.look, &g, s, buf.area).into_iter().collect()
+                }
+                Kind::Sticky(_) => marco::orillas(&mut self.painter, &buf, &self.look, &g, s),
             };
-            let gw = self.text.width(g, false, s);
-            self.text.draw(pix, g, col, false, x * s + (bw * s - gw) / 2.0, ty, s, all);
+            self.wins[i].marco = Some((clave, tiras));
+        }
+        if let Some((_, tiras)) = &self.wins[i].marco {
+            marco::poner(pix, tiras);
         }
 
-        let (cx, cy, cw, ch) = self.content(i);
-        let clip = Clip { x0: 0, y0: (bh + s) as i32, x1: pw as i32, y1: ph as i32 };
-        match &mut self.wins[i].kind {
-            Kind::Sticky(st) => {
-                let images = &self.images;
-                let Text { fonts, cache, font } = &mut self.text;
-                let labels = st.doc.draw(pix, fonts, cache, font, &|p| images.get(p), cx, cy - st.scroll, clip, focused && st.renaming.is_none());
-                let empty = st.doc.is_empty();
-                let heights = st.doc.heights(font, &|p| images.get(p));
-                let total: f32 = heights.iter().sum();
-                let scroll = st.scroll;
-                for (x, y, m) in labels {
-                    self.text.draw(pix, &m, c.muted, false, x, y, s, clip);
-                }
-                if empty {
-                    let ph_text = l("Escribe… (Ctrl+V pega imágenes)", "Type… (Ctrl+V pastes images)");
-                    self.text.draw(pix, ph_text, gfx::with_alpha(c.muted, 0.7), false, cx + 2.0 * s, cy, s, clip);
-                }
-                // la barrita de desplazamiento, si no cabe
-                if total > ch + 1.0 {
-                    let track = ch;
-                    let th = (track * ch / total).max(20.0 * s);
-                    let ty = cy + (track - th) * (scroll / (total - ch));
-                    gfx::rounded(pix, pw as f32 - 4.0 * s, ty, 2.5 * s, th, 1.5 * s, gfx::with_alpha(c.muted, 0.6));
-                }
-                let _ = cw;
+        let (cx, cy, _cw, ch) = self.content(i);
+        let clip = Clip { x0: 0, y0: ((g.oy + g.ch) * s) as i32, x1: pw as i32, y1: ((g.oy + (g.rows as f32 - 1.0) * g.ch) * s) as i32 };
+        if let Kind::Sticky(st) = &mut self.wins[i].kind {
+            let images = &self.images;
+            let Text { fonts, cache, font } = &mut self.text;
+            let labels = st.doc.draw(pix, fonts, cache, font, &|p| images.get(p), cx, cy - st.scroll, clip, focused && st.renaming.is_none());
+            let empty = st.doc.is_empty();
+            let heights = st.doc.heights(font, &|p| images.get(p));
+            let total: f32 = heights.iter().sum();
+            let scroll = st.scroll;
+            for (x, y, m) in labels {
+                self.text.draw(pix, &m, c.muted, false, x, y, s, clip);
             }
-            Kind::List(lw) => {
-                paint_list(lw, pix, &mut self.text, &c, &self.look, s, cx, cy, cw, ch, focused);
+            if empty {
+                let ph_text = l("Escribe… (Ctrl+V pega imágenes)", "Type… (Ctrl+V pastes images)");
+                self.text.draw(pix, ph_text, gfx::with_alpha(c.muted, 0.7), false, cx, cy, s, clip);
             }
-        }
-        // algo arrastrándose encima: la orilla del color del look
-        if self.wins[i].drop_on {
-            let lw = (2.0 * s).round();
-            gfx::stroke(pix, 0.0, 0.0, pw as f32, ph as f32, 0.0, lw, c.primary);
+            // la barrita de desplazamiento, sobre el borde derecho, si no cabe
+            if total > ch + 1.0 {
+                let th = (ch * ch / total).max(g.ch * s);
+                let ty = cy + (ch - th) * (scroll / (total - ch));
+                let bx = (g.ox + (g.cols as f32 - 0.5) * g.cw) * s - 1.5 * s;
+                gfx::rounded(pix, bx, ty, 3.0 * s, th, 1.5 * s, c.primary);
+            }
         }
     }
 
@@ -1115,7 +1093,7 @@ impl App {
 
     fn key_list(&mut self, i: usize, ev: KeyEvent) {
         let ctrl = self.ctrl;
-        let rows = list_rows(self.wins[i].size.1 as f32, &self.text);
+        let rows = list_rows(&self.grid(i));
         let Kind::List(lw) = &mut self.wins[i].kind else { return };
         let mut open = None;
         match ev.keysym {
@@ -1202,13 +1180,23 @@ impl App {
     }
 
     fn button_at(&self, i: usize, x: f64, y: f64) -> Option<Btn> {
-        if y > bar_h(&self.text) as f64 {
+        if y > self.grid(i).bar() as f64 {
             return None;
         }
-        button_rects(self.wins[i].size.0 as f32, &self.text, &self.wins[i].kind)
-            .into_iter()
-            .find(|(_, bx, bw)| x as f32 >= *bx && (x as f32) < bx + bw)
-            .map(|(b, ..)| b)
+        // los botones al final del borde de arriba, de 3 celdas (como en marco::recuadro)
+        let g = self.grid(i);
+        let (col, row) = g.cell(x as f32, y as f32)?;
+        if row != 0 {
+            return None;
+        }
+        let mut x0 = g.cols.saturating_sub(2);
+        for b in buttons(&self.wins[i].kind).iter().rev() {
+            x0 = x0.saturating_sub(3);
+            if col >= x0 && col < x0 + 3 {
+                return Some(*b);
+            }
+        }
+        None
     }
 
     fn cursor_for(&self, i: usize, x: f64, y: f64) -> CursorIcon {
@@ -1224,7 +1212,7 @@ impl App {
             Some(ResizeEdge::Right) => CursorIcon::EResize,
             Some(ResizeEdge::Top) => CursorIcon::NResize,
             Some(ResizeEdge::Bottom) => CursorIcon::SResize,
-            _ if y <= bar_h(&self.text) as f64 => {
+            _ if y <= self.grid(i).bar() as f64 => {
                 if self.button_at(i, x, y).is_some() {
                     CursorIcon::Pointer
                 } else {
@@ -1248,7 +1236,7 @@ impl App {
             self.wins[i].window.resize(seat, serial, e);
             return;
         }
-        if y <= bar_h(&self.text) as f64 {
+        if y <= self.grid(i).bar() as f64 {
             match self.button_at(i, x, y) {
                 Some(Btn::Close) => self.close(i),
                 Some(Btn::New) => self.new_sticky(None, None),
@@ -1286,13 +1274,14 @@ impl App {
                 self.redraw(i);
             }
             Kind::List(_) => {
-                let row_h = (self.text.font.line() * 1.3).round();
-                let top = (cy / s) + self.text.font.line() * 1.8;
+                // los renglones empiezan en el 3 (borde, búsqueda, línea)
+                let g = self.grid(i);
+                let Some((_, row)) = g.cell(x as f32, y as f32) else { return };
                 let Kind::List(lw) = &mut self.wins[i].kind else { return };
-                if (y as f32) < top {
+                if row < 3 || row + 1 >= g.rows {
                     return;
                 }
-                let r = lw.top + ((y as f32 - top) / row_h) as usize;
+                let r = lw.top + (row - 3) as usize;
                 if r < lw.matches.len() {
                     lw.sel = r;
                     let p = lw.notes[lw.matches[r]].path.clone();
@@ -1329,7 +1318,7 @@ impl App {
     /// cuando se levantan los dedos: ahí sigue solo con inercia).
     fn scroll(&mut self, i: usize, dy: f64, discrete: bool, stop: bool) {
         let lh = self.text.font.line() as f64;
-        let rows = list_rows(self.wins[i].size.1 as f32, &self.text);
+        let rows = list_rows(&self.grid(i));
         let now = Instant::now();
         let w = &mut self.wins[i];
         if let Kind::List(lw) = &mut w.kind {
@@ -1467,64 +1456,68 @@ fn filter_list(lw: &mut ListWin) {
     lw.top = 0;
 }
 
-fn list_rows(h: f32, text: &Text) -> usize {
-    let row_h = (text.font.line() * 1.3).round();
-    let used = bar_h(text) + pad(text) + text.font.line() * 1.8;
-    (((h - used) / row_h).floor() as usize).max(1)
+/// Renglones de la lista que caben: menos el borde, la búsqueda y su línea.
+fn list_rows(g: &marco::Grid) -> usize {
+    (g.rows as usize).saturating_sub(4).max(1)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn paint_list(lw: &ListWin, pix: &mut tiny_skia::PixmapMut, text: &mut Text, c: &Colors, look: &Look, s: f32, cx: f32, cy: f32, cw: f32, _ch: f32, focused: bool) {
-    let clip = Clip::all(pix);
-    let lh = text.font.line() * s;
+/// La lista de notas en celdas, como jale: la búsqueda, una línea y los
+/// renglones con la selección del look.
+fn celdas_lista(lw: &ListWin, buf: &mut ratatui::buffer::Buffer, look: &Look, focused: bool) {
+    use ratatui::style::{Modifier, Style};
+    let t = look.theme;
+    let (w, h) = (buf.area.width, buf.area.height);
+    let put = |buf: &mut ratatui::buffer::Buffer, x: u16, y: u16, s: &str, st: Style| buf.set_stringn(x, y, s, w.saturating_sub(x + 1) as usize, st).0;
     // la búsqueda
-    let q = if lw.query.is_empty() { l("buscar…", "search…").to_string() } else { lw.query.clone() };
-    let qcol = if lw.query.is_empty() { c.muted } else { c.fg };
-    let cursor_x = cx + if lw.query.is_empty() { 0.0 } else { text.width(&lw.query, false, s) };
+    put(buf, 2, 1, "›", Style::new().fg(t.primary).add_modifier(Modifier::BOLD));
+    let x = if lw.query.is_empty() {
+        put(buf, 5, 1, l("buscar…", "search…"), Style::new().fg(t.muted));
+        4
+    } else {
+        put(buf, 4, 1, &lw.query, Style::new().fg(t.fg))
+    };
     if focused {
-        gfx::fill(pix, cursor_x as i32, cy as i32, (2.0 * s) as u32, lh as u32, c.primary, clip);
+        buf.set_string(x, 1, " ", Style::new().bg(t.primary));
     }
-    text.draw(pix, &q, qcol, false, cx + if lw.query.is_empty() { 4.0 * s } else { 0.0 }, cy, s, clip);
     let count = format!("{}/{}", lw.matches.len(), lw.notes.len());
-    let cwid = text.width(&count, false, s);
-    text.draw(pix, &count, c.muted, false, cx + cw - cwid, cy, s, clip);
-    gfx::fill(pix, cx as i32, (cy + lh * 1.3) as i32, cw as u32, s as u32, gfx::with_alpha(c.border, 0.8), clip);
+    put(buf, w.saturating_sub(3 + count.chars().count() as u16), 1, &count, Style::new().fg(t.muted));
+    marco::linea(buf, look, 2);
 
-    let row_h = (text.font.line() * 1.3).round() * s;
-    let mut y = cy + lh * 1.8;
-    let inbox = store::inbox();
+    let filas = (h as usize).saturating_sub(4);
     if lw.matches.is_empty() {
         let msg = if lw.notes.is_empty() {
             l("Sin notas todavía. Ctrl+N crea una.", "No notes yet. Ctrl+N makes one.")
         } else {
             l("Nada. Enter la crea con ese nombre.", "Nothing. Enter creates it with that name.")
         };
-        text.draw(pix, msg, c.muted, false, cx, y, s, clip);
+        put(buf, 3, 3, msg, Style::new().fg(t.muted));
         return;
     }
-    for (r, &n) in lw.matches.iter().enumerate().skip(lw.top) {
-        if y + row_h > pix.height() as f32 {
-            break;
-        }
+    let inbox = store::inbox();
+    let (sel_st, marca) = look.sel(true);
+    for (k, (r, &n)) in lw.matches.iter().enumerate().skip(lw.top).take(filas).enumerate() {
+        let y = 3 + k as u16;
         let note = &lw.notes[n];
-        if r == lw.sel {
-            gfx::rounded(pix, cx - 4.0 * s, y, cw + 8.0 * s, row_h, 4.0 * s, gfx::with_alpha(c.hl, 0.9));
+        let elegido = r == lw.sel;
+        let mut st = Style::new().fg(t.fg);
+        if elegido {
+            buf.set_style(ratatui::layout::Rect::new(1, y, w - 2, 1), sel_st);
+            st = sel_st;
+            put(buf, 1, y, marca, sel_st);
         }
-        let ty = y + (row_h - lh) / 2.0;
-        let mut x = cx;
+        let mut x = 3;
         if look.icons {
             let ic = if note.path == inbox { "󰚇" } else { "󰎞" };
-            text.draw(pix, ic, c.primary, false, x, ty, s, clip);
-            x += text.width("󰎞 ", false, s);
+            put(buf, x, y, ic, if elegido { sel_st } else { Style::new().fg(t.primary) });
+            x += 2;
         }
         let when = store::when(note.modified);
-        let ww = text.width(&when, false, s);
+        let ww = when.chars().count() as u16;
         let mark = lw.confirm.as_ref() == Some(&note.path);
         let title = if mark { format!("{} {}", l("¿borrar? Ctrl+D", "delete? Ctrl+D"), note.title) } else { note.title.clone() };
-        let t = text.fit(&title, r == lw.sel, s, cx + cw - ww - x - 12.0 * s);
-        text.draw(pix, &t, if mark { c.red } else { c.fg }, r == lw.sel, x, ty, s, clip);
-        text.draw(pix, &when, c.muted, false, cx + cw - ww, ty, s, clip);
-        y += row_h;
+        let espacio = w.saturating_sub(x + ww + 5) as usize;
+        put(buf, x, y, &marco::recorta(&title, espacio), if mark { Style::new().fg(t.red) } else { st });
+        put(buf, w - 3 - ww, y, &when, if elegido { sel_st } else { Style::new().fg(t.muted) });
     }
 }
 
@@ -1654,6 +1647,8 @@ fn run(first: Cmd, listener: UnixListener) -> R<()> {
         look,
         colors,
         text: Text::new(),
+        painter: Painter::new(),
+        look_ver: 0,
         images: Images::new(itx),
         quit: false,
         last_poll: Instant::now(),
@@ -1908,7 +1903,7 @@ fn drop_mime(types: &[String]) -> Option<String> {
 impl App {
     /// El cursor de la nota donde va el puntero (ahí cae lo que se suelte).
     fn place_cursor(&mut self, i: usize, x: f64, y: f64) {
-        if y <= bar_h(&self.text) as f64 {
+        if y <= self.grid(i).bar() as f64 {
             return;
         }
         let s = self.wins[i].scale.max(1) as f32;

@@ -9,6 +9,7 @@ mod fuzzy;
 mod gfx;
 mod gui;
 mod images;
+mod marco;
 mod merge;
 mod store;
 mod sync;

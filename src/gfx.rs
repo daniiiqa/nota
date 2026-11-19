@@ -13,8 +13,6 @@ pub struct Colors {
     pub primary: Color,
     pub muted: Color,
     pub border: Color,
-    pub hl: Color,
-    pub red: Color,
     /// la opacidad del fondo (la de kitty si el look es transparente)
     pub alpha: f32,
 }
@@ -39,8 +37,6 @@ impl Colors {
             primary: rgb(t.primary, (120, 160, 230)),
             muted: rgb(t.muted, (128, 128, 128)),
             border: rgb(t.border, (70, 70, 70)),
-            hl: rgb(t.hl, (60, 70, 90)),
-            red: rgb(t.red, (220, 70, 50)),
             // un fondo de nota siempre se tiene que poder leer
             alpha: look.alpha().max(0.9),
         }
@@ -119,12 +115,6 @@ pub struct Clip {
     pub y0: i32,
     pub x1: i32,
     pub y1: i32,
-}
-
-impl Clip {
-    pub fn all(pix: &PixmapMut) -> Clip {
-        Clip { x0: 0, y0: 0, x1: pix.width() as i32, y1: pix.height() as i32 }
-    }
 }
 
 /// Todo de un color (el fondo): se escribe tal cual, sin mezclar, que es lo
@@ -252,30 +242,6 @@ impl Text {
         b.set_text(s, &attrs, Shaping::Advanced, None);
         b.shape_until_scroll(&mut self.fonts, false);
         b
-    }
-
-    /// Ancho en px del buffer (a escala `scale`).
-    pub fn width(&mut self, s: &str, bold: bool, scale: f32) -> f32 {
-        if s.is_empty() {
-            return 0.0;
-        }
-        let b = self.shape(s, Color::rgb(0, 0, 0), bold, scale);
-        b.layout_runs().map(|r| r.line_w).fold(0.0, f32::max)
-    }
-
-    /// Lo que cabe en `max` px: entero o cortado con "…".
-    pub fn fit(&mut self, s: &str, bold: bool, scale: f32, max: f32) -> String {
-        if self.width(s, bold, scale) <= max {
-            return s.to_string();
-        }
-        let chars: Vec<char> = s.chars().collect();
-        let (mut lo, mut hi) = (0, chars.len());
-        while lo < hi {
-            let mid = (lo + hi).div_ceil(2);
-            let t: String = chars[..mid].iter().collect::<String>() + "…";
-            if self.width(&t, bold, scale) <= max { lo = mid } else { hi = mid - 1 }
-        }
-        chars[..lo].iter().collect::<String>() + "…"
     }
 
     /// Dibuja `s` con la caja de su renglón empezando en (x, y).
